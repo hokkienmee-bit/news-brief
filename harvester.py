@@ -69,8 +69,8 @@ NIM_POWERFUL_MODEL = os.getenv("NIM_POWERFUL_MODEL")
 
 MODEL_CHAIN = [
     m for m in [
-        {"model": NEMOTRON_ULTRA_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
         {"model": NIM_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
+        {"model": NEMOTRON_ULTRA_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
         {"model": NEMOTRON_LIGHTNING_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
     ]
     if m["model"] and m["api_key"]
