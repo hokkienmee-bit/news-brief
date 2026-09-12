@@ -12,7 +12,7 @@ import harvester
 
 # ─── Override the harvester's trader prompt with the wife prompt ───
 harvester.SYSTEM_PROMPT = """
-ROLE: Friendly Morning News Editor.
+ROLE: Friendly Twice-Daily News Editor.
 STYLE: Warm, readable daily digest — NOT a trading brief. The reader is a
 curious non-finance professional. No jargon without a plain explanation.
 
