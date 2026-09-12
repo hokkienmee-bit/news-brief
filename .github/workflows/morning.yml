@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: "0 22 * * *"      # 22:00 UTC = 6:00 PM EDT
     - cron: "30 8 * * *"      # 08:30 UTC = 4:30 AM EDT
-  workflow_dispatch:          # manual "Run workflow" button for testing
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -56,4 +56,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: gautamkrishnar/keepalive-workflow@v2
+      - uses: actions/checkout@v4
+
+      - name: Keepalive (empty commit to reset 60-day inactivity clock)
+        run: |
+          git config user.name "keepalive-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive [skip ci]"
+          git push
