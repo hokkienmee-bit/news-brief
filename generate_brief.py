@@ -36,6 +36,7 @@ RULES:
   6. First line MUST be `### YOUR MORNING BRIEF`. No intro, no conclusion.
 """
 
+harvester.REQUIRED_HEADERS = ["YOUR MORNING BRIEF"]
 
 def md_to_html(md: str) -> str:
     """Tiny markdown-to-HTML converter for h3/h4/bullets/paragraphs."""
