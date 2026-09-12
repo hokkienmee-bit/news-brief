@@ -80,7 +80,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Morning Brief</title>
+<title>News Brief</title>
 <style>
   body {{ font-family: Georgia, 'Times New Roman', serif; margin: 0;
          background: #fdf8f4; color: #33302b; }}
