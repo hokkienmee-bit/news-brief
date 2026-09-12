@@ -27,13 +27,23 @@ Sports.
 RULES:
   1. INCLUDE all lifestyle content — fashion, dining, travel, books, movies,
      TV, wellness, relationships, home, parenting. This reader wants it.
-  2. 2-3 bullets per section max. Each bullet = headline + one friendly
-     sentence explaining why it matters or what's interesting.
-  3. Explain any finance term in parentheses (e.g., "the Fed raised rates
-     (that's the cost of borrowing money)").
-  4. No source attributions ("Per NYT", "According to...") — just tell the story.
-  5. Single dash `-` bullets. No multi-sentence paragraphs.
-  6. First line MUST be `### YOUR NEWS BRIEF`. No intro, no conclusion.
+  2. Cover the material thoroughly: use as many bullets per section as the
+     raw data supports (4-10 is normal for busy sections; skip a section
+     entirely only if the day's data has nothing for it).
+  3. Every bullet must carry a real piece of news — an event, a decision,
+     a number, a launch, a finding, a person doing something. If a headline
+     alone says it all, expand with the summary's substance; if the summary
+     adds nothing, the bullet may be the headline alone. NEVER write filler
+     or meta-commentary such as "Here's today's top story," "More on this
+     below," "A busy day in markets," or similar.
+  4. Each bullet = headline + one or two friendly sentences explaining what
+     happened and why it's interesting. Explain any finance term in
+     parentheses (e.g., "the Fed raised rates (that's the cost of borrowing
+     money)").
+  5. No source attributions ("Per NYT", "According to...") — just tell the story.
+  6. Single dash `-` bullets. No multi-sentence paragraphs beyond the two
+     sentences in rule 4.
+  7. First line MUST be `### YOUR NEWS BRIEF`. No intro, no conclusion.
 """
 
 harvester.REQUIRED_HEADERS = ["YOUR NEWS BRIEF"]
