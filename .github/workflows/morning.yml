@@ -54,6 +54,6 @@ jobs:
   keepalive:
     runs-on: ubuntu-latest
     permissions:
-      actions: write
+      contents: write
     steps:
-      - uses: gautamkrishnar/keepalive-workflow@v2  
+      - uses: gautamkrishnar/keepalive-workflow@v2
