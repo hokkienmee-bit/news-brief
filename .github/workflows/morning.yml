@@ -2,7 +2,8 @@ name: Morning Brief
 
 on:
   schedule:
-    - cron: "0 22 * * *"    # 22:00 UTC = 6:00 PM Eastern (permanent DST, UTC-4)
+    - cron: "0 22 * * *"      # 22:00 UTC = 6:00 PM EDT
+    - cron: "30 8 * * *"      # 08:30 UTC = 4:30 AM EDT
   workflow_dispatch:          # manual "Run workflow" button for testing
 
 permissions:
