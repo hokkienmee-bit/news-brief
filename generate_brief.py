@@ -38,8 +38,19 @@ RULES:
 
 harvester.REQUIRED_HEADERS = ["YOUR MORNING BRIEF"]
 
+import html as html_lib   # add this import at the top with the others
+
+
+def _inline(s: str) -> str:
+    """Escape HTML, then convert **bold** and *italic* to tags."""
+    s = html_lib.escape(s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", s)
+    return s
+
+
 def md_to_html(md: str) -> str:
-    """Tiny markdown-to-HTML converter for h3/h4/bullets/paragraphs."""
+    """Markdown-to-HTML: h2/h3, bullets, disclaimer, bold/italic inline."""
     lines = md.strip().split("\n")
     out = []
     in_list = False
@@ -47,23 +58,22 @@ def md_to_html(md: str) -> str:
         s = line.strip()
         if s.startswith("### "):
             if in_list: out.append("</ul>"); in_list = False
-            out.append(f"<h2>{s[4:]}</h2>")
+            out.append(f"<h2>{_inline(s[4:])}</h2>")
         elif s.startswith("#### "):
             if in_list: out.append("</ul>"); in_list = False
-            out.append(f"<h3>{s[5:]}</h3>")
+            out.append(f"<h3>{_inline(s[5:])}</h3>")
         elif s.startswith("- "):
             if not in_list:
                 out.append("<ul>"); in_list = True
-            out.append(f"<li>{s[2:]}</li>")
+            out.append(f"<li>{_inline(s[2:])}</li>")
         elif s.startswith("*(") and s.endswith(")*"):
-            out.append(f"<p class='disclaimer'>{s[2:-2]}</p>")
+            out.append(f"<p class='disclaimer'>{_inline(s[2:-2])}</p>")
         elif s:
             if in_list: out.append("</ul>"); in_list = False
-            out.append(f"<p>{s}</p>")
+            out.append(f"<p>{_inline(s)}</p>")
     if in_list:
         out.append("</ul>")
     return "\n".join(out)
-
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
