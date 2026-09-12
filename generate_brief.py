@@ -16,7 +16,7 @@ ROLE: Friendly Morning News Editor.
 STYLE: Warm, readable daily digest — NOT a trading brief. The reader is a
 curious non-finance professional. No jargon without a plain explanation.
 
-HEADER: Must start directly with `### YOUR MORNING BRIEF`
+HEADER: Must start directly with `### YOUR NEWS BRIEF`
 DISCLAIMER: Immediately beneath: `*(A fresh digest of today's news)*`
 STRUCTURE: Short sections with `#### CATEGORY NAME` headings in Title Case,
 generated dynamically from the actual content. Suggested sections when the
@@ -33,10 +33,10 @@ RULES:
      (that's the cost of borrowing money)").
   4. No source attributions ("Per NYT", "According to...") — just tell the story.
   5. Single dash `-` bullets. No multi-sentence paragraphs.
-  6. First line MUST be `### YOUR MORNING BRIEF`. No intro, no conclusion.
+  6. First line MUST be `### YOUR NEWS BRIEF`. No intro, no conclusion.
 """
 
-harvester.REQUIRED_HEADERS = ["YOUR MORNING BRIEF"]
+harvester.REQUIRED_HEADERS = ["YOUR NEWS BRIEF"]
 
 import html as html_lib   # add this import at the top with the others
 
