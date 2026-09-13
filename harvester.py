@@ -9,11 +9,9 @@
    (Ultra primary, fallback via env) with output VALIDATION GATE.
 4. Writes only validated briefs to disk. Raw API responses archived to
    ./llm_debug/ for forensics.
-
   No intermediate JSON file required — feed fetching is built in.
 ================================================================================
 """
-
 import os
 import sys
 import re
@@ -23,7 +21,6 @@ import time
 import random
 import logging
 import datetime
-import subprocess
 import hashlib
 import warnings
 import xml.etree.ElementTree as ET
@@ -33,15 +30,12 @@ from dataclasses import dataclass
 import urllib.request
 import urllib.error
 from urllib.error import HTTPError
-
 try:
     from dotenv import load_dotenv
 except ImportError:
     print("Error: 'python-dotenv' required. Run: pip install python-dotenv")
     sys.exit(1)
-
 warnings.filterwarnings("ignore")
-
 # ==============================================================================
 # ENVIRONMENT & CONFIGURATION
 # ==============================================================================
@@ -52,21 +46,17 @@ for var in ["NVIDIA_API_KEY", "NEMOTRON_ULTRA_MODEL",
             "NEMOTRON_LIGHTNING_MODEL", "NIM_POWERFUL_MODEL"]:
     v = os.getenv(var)
     print(f"{var}: {'SET (len=%d)' % len(v) if v else 'MISSING'}")
-
 # --- Output config ---
-OUTPUT_DIR = Path(r"C:/Code/Trading")
 OUTPUT_FILENAME = "news_intelligence_brief.txt"
 RAW_DUMP_FILENAME = "news_context_raw_dump.txt"
 KEEP_RAW_DUMP = True
-DEBUG_DIR = OUTPUT_DIR / "llm_debug"
-
+DEBUG_DIR = Path("llm_debug")
 # --- NVIDIA API CONFIG (override via .env) ---
-NVIDIA_API_BASE = os.getenv("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1")
+NVIDIA_API_BASE = "https://integrate.api.nvidia.com/v1"
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NEMOTRON_ULTRA_MODEL = os.getenv("NEMOTRON_ULTRA_MODEL")
 NEMOTRON_LIGHTNING_MODEL = os.getenv("NEMOTRON_LIGHTNING_MODEL")
 NIM_POWERFUL_MODEL = os.getenv("NIM_POWERFUL_MODEL")
-
 MODEL_CHAIN = [
     m for m in [
         {"model": NIM_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
@@ -75,33 +65,26 @@ MODEL_CHAIN = [
     ]
     if m["model"] and m["api_key"]
 ]
-
 if not MODEL_CHAIN:
     logging.error("No valid models configured. .env loaded? Vars present?")
     sys.exit(1)
-
 ATTEMPTS_PER_MODEL = 2
 MAX_OUTPUT_TOKENS = 8000
 LLM_TEMPERATURE = 0.1
 LLM_RATE_LIMIT_BACKOFF = 30
 LLM_REQUEST_TIMEOUT = 300
-
 # --- INPUT SIZE GUARDS ---
 MAX_CHARS_PER_ITEM = 500
 INPUT_CHAR_BUDGET = 100_000
-
 # --- FEED FETCH GUARDS ---
 FEED_TIMEOUT = 15
 FEED_PAUSE_RANGE = (0.3, 0.8)   # polite pause between feed requests
-
 # --- THINKING MODE ---
 NO_THINK_KWARG = True
-
 # --- OUTPUT VALIDATION GATE ---
 MIN_BRIEF_CHARS = 600
 MIN_WORD_RATIO = 0.60
 REQUIRED_HEADERS = ["NEWS INTELLIGENCE BRIEF"]
-
 # ==============================================================================
 # FEED CONFIGURATION — organized by publication
 # ==============================================================================
@@ -133,12 +116,10 @@ FEEDS = {
     "FT: Americas": "https://www.ft.com/world/americas?format=rss",
     "FT: Asia-Pacific": "https://www.ft.com/world/asia-pacific?format=rss",
     "FT: Middle East & North Africa": "https://www.ft.com/world/middle-east-north-africa?format=rss",
-
     # ─── Wall Street Journal ───
     "WSJ: World News": "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
     "WSJ: Markets": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     "WSJ: US Business": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
-
     # ─── The New York Times ───
     "NYT: Home Page": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
     "NYT: World": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
@@ -167,7 +148,6 @@ FEEDS = {
     "NYT: Obituaries": "https://rss.nytimes.com/services/xml/rss/nyt/Obituaries.xml",
     "NYT: Corrections": "https://rss.nytimes.com/services/xml/rss/nyt/Corrections.xml",
     "NYT: Your Money": "https://rss.nytimes.com/services/xml/rss/nyt/YourMoney.xml",
-
     # ─── Bloomberg ───
     "Bloomberg: Markets": "https://feeds.bloomberg.com/markets/news.rss",
     "Bloomberg: Politics": "https://feeds.bloomberg.com/politics/news.rss",
@@ -177,7 +157,6 @@ FEEDS = {
     "Bloomberg: Economics": "https://feeds.bloomberg.com/economics/news.rss",
     "Bloomberg: Industries": "https://feeds.bloomberg.com/industries/news.rss",
     "Bloomberg: Green": "https://feeds.bloomberg.com/green/news.rss",
-
     # ─── South China Morning Post ───
     "SCMP: World": "https://www.scmp.com/rss/5/feed",
     "SCMP: This Week in Asia": "https://www.scmp.com/rss/3/feed",
@@ -189,7 +168,6 @@ FEEDS = {
     "SCMP: Lifestyle": "https://www.scmp.com/rss/94/feed",
     "SCMP: Tech": "https://www.scmp.com/rss/36/feed",
     "SCMP: Business": "https://www.scmp.com/rss/92/feed",
-
     # ─── Washington Post ───
     "WaPo: World": "https://feeds.washingtonpost.com/rss/world",
     "WaPo: National": "https://feeds.washingtonpost.com/rss/national",
@@ -197,13 +175,11 @@ FEEDS = {
     "WaPo: Technology": "https://feeds.washingtonpost.com/rss/technology",
     "WaPo: Politics": "https://feeds.washingtonpost.com/rss/politics",
 }
-
 # ==============================================================================
 # LOGGING
 # ==============================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] - %(message)s')
 logger = logging.getLogger("RSSIntelHarvester")
-
 # ==============================================================================
 # HTTP & UTILS
 # ==============================================================================
@@ -213,7 +189,6 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive"
 }
-
 def http_get(url: str, timeout=30) -> bytes:
     """GET with gzip handling; returns raw bytes (needed for XML)."""
     try:
@@ -226,7 +201,6 @@ def http_get(url: str, timeout=30) -> bytes:
     except Exception as e:
         logger.error(f"HTTP Fail [{url}]: {e}")
         return b""
-
 # ==============================================================================
 # DATE PARSING
 # ==============================================================================
@@ -249,7 +223,6 @@ def parse_any_date(date_str: str) -> datetime.datetime:
         return parser.parse(s).astimezone(datetime.timezone.utc)
     except Exception:
         return datetime.datetime.now(datetime.timezone.utc)
-
 # ==============================================================================
 # RSS / ATOM PARSING
 # ==============================================================================
@@ -259,7 +232,6 @@ NS = {
     "content": "http://purl.org/rss/1.0/modules/content/",
     "atom": "http://www.w3.org/2005/Atom",
 }
-
 @dataclass
 class Article:
     guid: str
@@ -269,7 +241,6 @@ class Article:
     summary: str
     source_feed: str
     publication: str
-
 def _text(elem: Optional[ET.Element], tag: str, ns: dict = None) -> str:
     if elem is None:
         return ""
@@ -277,7 +248,6 @@ def _text(elem: Optional[ET.Element], tag: str, ns: dict = None) -> str:
     if child is None:
         return ""
     return (child.text or "").strip()
-
 def parse_feed(xml_content: bytes, feed_name: str) -> list[Article]:
     articles = []
     if not xml_content:
@@ -287,10 +257,8 @@ def parse_feed(xml_content: bytes, feed_name: str) -> list[Article]:
     except ET.ParseError as e:
         logger.warning(f"  ✗ XML parse error in {feed_name}: {e}")
         return articles
-
     publication = feed_name.split(":")[0].strip() if ":" in feed_name else "Unknown"
     channel = root.find("channel")
-
     if channel is not None:
         # RSS 2.0
         for item in channel.findall("item"):
@@ -321,7 +289,6 @@ def parse_feed(xml_content: bytes, feed_name: str) -> list[Article]:
             if title and (guid or link):
                 articles.append(Article(guid or link, title, link, pub_date, summary, feed_name, publication))
     return articles
-
 # ==============================================================================
 # HARVEST: fetch all feeds -> dedupe -> date filter
 # ==============================================================================
@@ -331,12 +298,10 @@ def harvest_feeds() -> list[Article]:
     today = now_utc.date()
     yesterday = (now_utc - datetime.timedelta(days=1)).date()
     allowed = {today, yesterday}
-
     all_articles: dict[str, Article] = {}
     pubs = {}
     for name, url in FEEDS.items():
         pubs.setdefault(name.split(":")[0], []).append((name, url))
-
     total_raw = 0
     for pub, feeds in pubs.items():
         print(f"  ── {pub} ({len(feeds)} feeds) ──")
@@ -358,19 +323,15 @@ def harvest_feeds() -> list[Article]:
                     kept += 1
             print(f"    ✓ {feed_name}: {len(articles)} fetched, {kept} in window")
             time.sleep(random.uniform(*FEED_PAUSE_RANGE))
-
     logger.info(f"Harvest: {total_raw} raw items, {len(all_articles)} unique in today/yesterday window.")
     return sorted(all_articles.values(), key=lambda a: a.pub_date, reverse=True)
-
 # ==============================================================================
 # SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF
 # ==============================================================================
 SYSTEM_PROMPT = """
 ROLE: Senior Macro Intelligence Analyst.
 STYLE: Ultra-concise, dense financial intelligence brief. Zero conversational filler, zero setup sentences, zero meta-commentary.
-
 TASK: Process the provided raw news headlines + summaries from major financial publications (FT, WSJ, NYT, Bloomberg, SCMP, Washington Post) and transform them into a single, highly scannable section.
-
 ================================================================================
 NEWS INTELLIGENCE BRIEF
 ================================================================================
@@ -386,7 +347,6 @@ CONSTRAINTS:
   4. DO NOT start bullets with "Per FT", "According to WSJ", "Bloomberg reports...".
   5. Jump straight to the core metric/event/entity (e.g., `- Brent crude topped $91/bbl on Hormuz closure risk...`).
   6. Discard pure noise: generic "markets mixed" wrap-ups, clickbait, non-financial lifestyle fluff.
-
 ================================================================================
 GENERAL SYNTAX & FORMATTING STRICT RULES
 ================================================================================
@@ -395,7 +355,6 @@ GENERAL SYNTAX & FORMATTING STRICT RULES
 3. Minimize passive verbs/filler. Use high-impact verbs (surged, printed, plummeted, eased, beat, missed, guided, launched, acquired).
 4. Be economical with words.
 """
-
 # ==============================================================================
 # LLM PIPELINE (HARDENED & FIXED)
 # ==============================================================================
@@ -407,29 +366,24 @@ def _save_debug(tag: str, text: str):
         (DEBUG_DIR / f"{ts}__{safe}.txt").write_text(text, encoding="utf-8")
     except Exception as e:
         logger.debug(f"Debug-save failed: {e}")
-
 def _validate_brief(text: str) -> tuple[bool, str]:
     t = (text or "").strip()
     if len(t) < MIN_BRIEF_CHARS:
         return False, f"too short ({len(t)} chars)"
-
     probe = t[:4000]
     readable = sum(ch.isalnum() or ch.isspace() for ch in probe) / max(len(probe), 1)
     if readable < MIN_WORD_RATIO:
         return False, f"non-textual output ({readable:.0%} readable chars)"
-
     upper = t.upper()
     for hdr in REQUIRED_HEADERS:
         if hdr not in upper:
             return False, f"missing required header '{hdr}'"
     return True, ""
-
 def _post_chat_completion(model_cfg: dict, user_prompt: str) -> tuple[str, str]:
     base_url = model_cfg["base_url"].rstrip("/")
     api_key  = model_cfg["api_key"]
     model    = model_cfg["model"]
     url      = f"{base_url}/chat/completions"
-
     def send(payload: dict) -> str:
         body = json.dumps(payload).encode("utf-8")
         hdrs = {
@@ -441,7 +395,6 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str) -> tuple[str, str]:
         req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
         with urllib.request.urlopen(req, timeout=LLM_REQUEST_TIMEOUT) as resp:
             return resp.read().decode("utf-8", errors="replace")
-
     payload = {
         "model": model,
         "messages": [
@@ -453,10 +406,8 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str) -> tuple[str, str]:
         "max_tokens": MAX_OUTPUT_TOKENS,
         "stream": False,
     }
-
     if NO_THINK_KWARG and "nemotron" in model.lower() and "nvidia" in base_url:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
-
     try:
         raw = send(payload)
     except HTTPError as e:
@@ -466,43 +417,33 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str) -> tuple[str, str]:
             raw = send(payload)
         else:
             raise
-
     _save_debug(f"response_{model}_attempt", raw)
-
     data = json.loads(raw)
     choice = (data.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
-
     content = msg.get("content")
     if isinstance(content, list):
         content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
     content = (content or "").strip()
-
     finish = choice.get("finish_reason", "?")
     usage = data.get("usage") or {}
     logger.info(f"[LLM] {model}: finish_reason={finish} | "
                 f"tokens {usage.get('prompt_tokens', '?')} in / {usage.get('completion_tokens', '?')} out")
-
     reasoning = (msg.get("reasoning_content") or "").strip()
     if not content and reasoning:
         logger.warning(f"[LLM] 'content' empty but {len(reasoning)} chars reasoning returned.")
         _save_debug(f"orphan_reasoning_{model}", reasoning)
-
     return content, finish
-
 def llm_prepare_file(user_prompt: str) -> tuple[str | None, str]:
     valid_chain = [m for m in MODEL_CHAIN if m.get("model") and m.get("base_url") and m.get("api_key")]
     if not valid_chain:
         logger.error("No valid models configured (check .env).")
         return None, ""
-
     if not NVIDIA_API_KEY and any("nvidia" in m["base_url"] for m in valid_chain):
         logger.error("NVIDIA_API_KEY missing for NVIDIA endpoints.")
         return None, ""
-
     logger.info(f"[LLM] Payload: {len(user_prompt):,} chars (~{len(user_prompt)//4:,} tokens est.)")
     _save_debug("last_request_user_message", user_prompt)
-
     for idx, model_cfg in enumerate(valid_chain):
         label = "PRIMARY" if idx == 0 else "FALLBACK"
         model_name = model_cfg["model"]
@@ -529,18 +470,15 @@ def llm_prepare_file(user_prompt: str) -> tuple[str | None, str]:
             except Exception as e:
                 logger.warning(f"[LLM] {label} failed: {e}")
             time.sleep(min(10, 3 * attempt))
-
         if idx < len(valid_chain) - 1:
             logger.info("[LLM] Falling back to next model...")
     return None, ""
-
 def strip_code_fences(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
         t = re.sub(r'^```[a-zA-Z]*\n', '', t)
         t = re.sub(r'\n```\s*$', '', t)
     return t.strip()
-
 # ==============================================================================
 # ORCHESTRATION
 # ==============================================================================
@@ -549,34 +487,26 @@ def main():
     print("  RSS INTELLIGENCE HARVESTER (ALL-IN-ONE)")
     print("  Fetch feeds -> filter -> LLM brief via NVIDIA Nemotron")
     print("=" * 60)
-
     # 1. Harvest feeds directly (fetch + parse + dedupe + date filter)
     articles = harvest_feeds()
     if not articles:
         logger.warning("Zero articles in window. Exiting.")
         return
-
     # 2. Build prompt with budget
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
     budget = {"left": INPUT_CHAR_BUDGET}
     stats = {"kept": 0, "dropped": 0}
-
     lines = []
     for art in articles:
         pub = art.publication
         title = art.title.strip()
         summary = art.summary.replace("\n", " ").strip()
         time_str = art.pub_date.strftime("%H:%M")
-
         line = f"[{time_str}] [{pub}] {title}"
         if summary:
             line += f" — {summary}"
-
         if len(line) > MAX_CHARS_PER_ITEM:
             line = line[:MAX_CHARS_PER_ITEM] + " …[truncated]"
-
         cost = len(line) + 1
         if cost > budget["left"]:
             stats["dropped"] += 1
@@ -584,14 +514,11 @@ def main():
         budget["left"] -= cost
         stats["kept"] += 1
         lines.append(line)
-
     logger.info(f"[Prompt] Kept {stats['kept']} items ({stats['dropped']} dropped by budget).")
-
     pubs = {}
     for art in articles[:stats["kept"]]:
         pubs[art.publication] = pubs.get(art.publication, 0) + 1
     pub_summary = ", ".join(f"{k}: {v}" for k, v in sorted(pubs.items()))
-
     user_prompt = "\n\n".join([
         "=" * 80,
         f"NEWS RAW DATA DUMP | {now_str}",
@@ -603,34 +530,22 @@ def main():
         "=" * 80,
         "END OF RAW DATA DUMP",
     ])
-
     if KEEP_RAW_DUMP:
         try:
-            (OUTPUT_DIR / RAW_DUMP_FILENAME).write_text(user_prompt, encoding="utf-8")
-            logger.info(f"Audit copy: {OUTPUT_DIR / RAW_DUMP_FILENAME}")
+            Path(RAW_DUMP_FILENAME).write_text(user_prompt, encoding="utf-8")
+            logger.info(f"Audit copy: {RAW_DUMP_FILENAME}")
         except Exception as e:
             logger.warning(f"Could not write raw dump: {e}")
-
     # 3. Call LLM pipeline
     brief, model_used = llm_prepare_file(user_prompt)
     if not brief:
         logger.error("All models failed validation. Raw dump + llm_debug retained.")
         sys.exit(1)
-
     # 4. Write output
-    out_path = OUTPUT_DIR / OUTPUT_FILENAME
     try:
-        out_path.write_text(brief, encoding="utf-8")
-        logger.info(f"SUCCESS [{model_used}]: Brief written -> {out_path}")
-
-        if sys.platform.startswith('win'):
-            os.startfile(OUTPUT_DIR)
-        elif sys.platform.startswith('darwin'):
-            subprocess.Popen(['open', OUTPUT_DIR])
-        else:
-            subprocess.Popen(['xdg-open', OUTPUT_DIR])
+        Path(OUTPUT_FILENAME).write_text(brief, encoding="utf-8")
+        logger.info(f"SUCCESS [{model_used}]: Brief written -> {OUTPUT_FILENAME}")
     except Exception as e:
         logger.error(f"Failed to write file: {e}")
-
 if __name__ == "__main__":
     main()
