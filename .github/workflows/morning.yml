@@ -1,33 +1,23 @@
-name: Morning Brief
-
+name: News Brief
 on:
-  schedule:
-    - cron: "0 22 * * *"      # 22:00 UTC = 6:00 PM EDT
-    - cron: "30 8 * * *"      # 08:30 UTC = 4:30 AM EDT
   workflow_dispatch:
-
 permissions:
   contents: read
   pages: write
   id-token: write
-
 concurrency:
   group: "pages"
   cancel-in-progress: false
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install deps
         run: pip install -r requirements.txt
-
       - name: Generate brief
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -35,12 +25,10 @@ jobs:
           NEMOTRON_LIGHTNING_MODEL: ${{ secrets.NEMOTRON_LIGHTNING_MODEL }}
           NIM_POWERFUL_MODEL: ${{ secrets.NIM_POWERFUL_MODEL }}
         run: python generate_brief.py
-
       - name: Upload to Pages
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
-
   deploy:
     needs: build
     runs-on: ubuntu-latest
@@ -50,17 +38,3 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
-
-  keepalive:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Keepalive (empty commit to reset 60-day inactivity clock)
-        run: |
-          git config user.name "keepalive-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit --allow-empty -m "chore: keepalive [skip ci]"
-          git push
