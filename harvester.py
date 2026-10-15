@@ -66,7 +66,8 @@ warnings.filterwarnings("ignore")
 loaded = load_dotenv()  # picks up .env in cwd if it exists
 print(f"load_dotenv returned: {loaded}")
 for var in ["NVIDIA_API_KEY", "NEMOTRON_ULTRA_MODEL",
-            "NEMOTRON_LIGHTNING_MODEL", "NIM_POWERFUL_MODEL"]:
+            "NEMOTRON_LIGHTNING_MODEL", "NIM_POWERFUL_MODEL",
+            "NEMOTRON_VPOWERFUL_MODEL", "NIM_ULTRA_POWERFUL_MODEL"]:
     v = os.getenv(var)
     print(f"{var}: {'SET (len=%d)' % len(v) if v else 'MISSING'}")
 # --- Output config ---
@@ -80,8 +81,12 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NEMOTRON_ULTRA_MODEL = os.getenv("NEMOTRON_ULTRA_MODEL")
 NEMOTRON_LIGHTNING_MODEL = os.getenv("NEMOTRON_LIGHTNING_MODEL")
 NIM_POWERFUL_MODEL = os.getenv("NIM_POWERFUL_MODEL")
+NIM_VPOWERFUL_MODEL = os.getenv("NIM_VPOWERFUL_MODEL")
+NIM_ULTRA_POWERFUL_MODEL = os.getenv("NIM_ULTRA_POWERFUL_MODEL")
 MODEL_CHAIN = [
     m for m in [
+        {"model": NIM_ULTRA_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
+        {"model": NIM_VPOWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
         {"model": NIM_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
         {"model": NEMOTRON_ULTRA_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
         {"model": NEMOTRON_LIGHTNING_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
