@@ -24,6 +24,8 @@ jobs:
           NEMOTRON_ULTRA_MODEL: ${{ secrets.NEMOTRON_ULTRA_MODEL }}
           NEMOTRON_LIGHTNING_MODEL: ${{ secrets.NEMOTRON_LIGHTNING_MODEL }}
           NIM_POWERFUL_MODEL: ${{ secrets.NIM_POWERFUL_MODEL }}
+          NIM_VPOWERFUL_MODEL: ${{ secrets.NIM_VPOWERFUL_MODEL }}
+          NIM_ULTRA_POWERFUL_MODEL: ${{ secrets.NIM_ULTRA_POWERFUL_MODEL }}
         run: python generate_brief.py
       - name: Upload to Pages
         uses: actions/upload-pages-artifact@v3
