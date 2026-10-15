@@ -709,7 +709,6 @@ HEADER: Must start directly with `### NEWS INTELLIGENCE BRIEF`
 DISCLAIMER: Immediately beneath header: `*(All data sourced from public RSS feeds: FT, WSJ, NYT, Bloomberg, SCMP, WaPo)*`
 STRUCTURE: Divide into short sub-topical blocks.
 SUB-HEADERS: Create your own Level-4 Markdown headings `#### CATEGORY NAME` in ALL CAPS that best fit the actual content. Do NOT use a fixed list. Generate categories dynamically from the feed — e.g., if the data contains central bank moves, create `#### CENTRAL BANKS & RATES`; if it contains semiconductor earnings, create `#### SEMICONDUCTORS & TECH`; if it contains China property, create `#### CHINA PROPERTY & CREDIT`. Every item must appear under some category. No item left uncategorized. Typical macro categories emerge naturally (central banks, bonds, geopolitics, commodities, economic data, corporate earnings, tech/AI, regional), but adapt to what's actually in the window.
-SUB-HEADER NUMBER AGREEMENT: Match the heading's number to the number of bullets beneath it — one bullet uses a singular heading (`#### TOP STORY`), two or more use plural (`#### TOP STORIES`). Never use a singular heading over multiple bullets.
 BULLETS: Single dash `-`, max 2-3 per sub-header.
 CONSTRAINTS:
   1. Every entry = one isolated bullet point. No multi-sentence paragraphs.
@@ -851,6 +850,71 @@ def strip_code_fences(text: str) -> str:
         t = re.sub(r'\n```\s*$', '', t)
     return t.strip()
 # ==============================================================================
+# HEADER NUMBER-AGREEMENT NORMALIZER (deterministic)
+# ==============================================================================
+# The model invents its own sub-headers, so it sometimes emits a singular
+# "lead item" heading (e.g. `#### TOP STORY`) above two or more bullets. The
+# prompt asks it not to, but prompts are advisory; this enforces it in code.
+#
+# Deliberately whitelist-based rather than a general pluralizer: a blanket rule
+# would wrongly rewrite legitimate category headings such as `#### TECHNOLOGY`
+# or `#### ENERGY` that merely happen to hold several bullets. Extend the map
+# below if the model starts emitting new singular lead headings.
+_HEADING_RE = re.compile(r'^(\s*#{2,6}\s+)(.*\S)\s*$')
+_BULLET_RE = re.compile(r'^\s*[-*]\s+\S')
+_SINGULAR_TO_PLURAL_HEADINGS = {
+    "TOP STORY": "TOP STORIES",
+    "LEAD STORY": "LEAD STORIES",
+    "MAIN STORY": "MAIN STORIES",
+    "KEY STORY": "KEY STORIES",
+    "TOP HEADLINE": "TOP HEADLINES",
+    "LEAD HEADLINE": "LEAD HEADLINES",
+    "HEADLINE": "HEADLINES",
+    "TOP THEME": "TOP THEMES",
+    "MAIN THEME": "MAIN THEMES",
+    "TOP UPDATE": "TOP UPDATES",
+    "TOP DEVELOPMENT": "TOP DEVELOPMENTS",
+}
+
+
+def _apply_case(sample: str, phrase: str) -> str:
+    """Render `phrase` in the same case style as `sample`."""
+    if sample.isupper():
+        return phrase
+    if sample.istitle():
+        return phrase.title()
+    return phrase.lower()
+
+
+def _pluralize_heading(heading: str) -> str:
+    """Map a known singular lead heading to its plural form, preserving case.
+    Returns the heading unchanged if it is not in the map."""
+    plural = _SINGULAR_TO_PLURAL_HEADINGS.get(heading.strip().upper())
+    if plural is None:
+        return heading
+    return _apply_case(heading.strip(), plural)
+
+
+def _normalize_header_number_agreement(text: str) -> str:
+    """Rewrite a singular lead sub-heading to plural when two or more bullets
+    sit beneath it. Only ever goes singular -> plural; category headings are
+    never touched."""
+    if not text:
+        return text
+    lines = text.split("\n")
+    headings = [(i, m) for i, line in enumerate(lines)
+                if (m := _HEADING_RE.match(line))]
+    for pos, (line_no, m) in enumerate(headings):
+        end = headings[pos + 1][0] if pos + 1 < len(headings) else len(lines)
+        bullets = sum(1 for l in lines[line_no + 1:end] if _BULLET_RE.match(l))
+        if bullets < 2:
+            continue
+        original = m.group(2)
+        updated = _pluralize_heading(original)
+        if updated != original:
+            lines[line_no] = m.group(1) + updated
+    return "\n".join(lines)
+# ==============================================================================
 # ORCHESTRATION
 # ==============================================================================
 def main():
@@ -918,7 +982,9 @@ def main():
     if not brief:
         logger.error("All models failed validation. Raw dump + llm_debug retained.")
         sys.exit(1)
-    # 4. Write output
+    # 4. Deterministic tidy-up: enforce singular/plural agreement on sub-headers.
+    brief = _normalize_header_number_agreement(brief)
+    # 5. Write output
     try:
         Path(OUTPUT_FILENAME).write_text(brief, encoding="utf-8")
         logger.info(f"SUCCESS [{model_used}]: Brief written -> {OUTPUT_FILENAME}")
