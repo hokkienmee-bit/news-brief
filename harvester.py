@@ -709,6 +709,7 @@ HEADER: Must start directly with `### NEWS INTELLIGENCE BRIEF`
 DISCLAIMER: Immediately beneath header: `*(All data sourced from public RSS feeds: FT, WSJ, NYT, Bloomberg, SCMP, WaPo)*`
 STRUCTURE: Divide into short sub-topical blocks.
 SUB-HEADERS: Create your own Level-4 Markdown headings `#### CATEGORY NAME` in ALL CAPS that best fit the actual content. Do NOT use a fixed list. Generate categories dynamically from the feed — e.g., if the data contains central bank moves, create `#### CENTRAL BANKS & RATES`; if it contains semiconductor earnings, create `#### SEMICONDUCTORS & TECH`; if it contains China property, create `#### CHINA PROPERTY & CREDIT`. Every item must appear under some category. No item left uncategorized. Typical macro categories emerge naturally (central banks, bonds, geopolitics, commodities, economic data, corporate earnings, tech/AI, regional), but adapt to what's actually in the window.
+SUB-HEADER NUMBER AGREEMENT: Match the heading's number to the number of bullets beneath it — one bullet uses a singular heading (`#### TOP STORY`), two or more use plural (`#### TOP STORIES`). Never use a singular heading over multiple bullets.
 BULLETS: Single dash `-`, max 2-3 per sub-header.
 CONSTRAINTS:
   1. Every entry = one isolated bullet point. No multi-sentence paragraphs.
