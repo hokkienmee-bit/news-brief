@@ -5,8 +5,8 @@
 ================================================================================
 1. Fetches all RSS feeds directly (FT, WSJ, NYT, Bloomberg, SCMP, WaPo).
 2. Parses XML (RSS 2.0 + Atom), deduplicates, filters to today + yesterday (UTC).
-3. Caps prompt size, sends dump + analyst instructions to NVIDIA Nemotron
-   (Ultra primary, fallback via env) with output VALIDATION GATE.
+3. Caps prompt size, sends dump + analyst instructions to NVIDIA Build models
+   (primary, fallback via env) with output VALIDATION GATE.
 4. Writes only validated briefs to disk. Raw API responses archived to
    ./llm_debug/ for forensics.
   No intermediate JSON file required — feed fetching is built in.
@@ -67,7 +67,7 @@ loaded = load_dotenv()  # picks up .env in cwd if it exists
 print(f"load_dotenv returned: {loaded}")
 for var in ["NVIDIA_API_KEY", "NEMOTRON_ULTRA_MODEL",
             "NEMOTRON_LIGHTNING_MODEL", "NIM_POWERFUL_MODEL",
-            "NEMOTRON_VPOWERFUL_MODEL", "NIM_ULTRA_POWERFUL_MODEL"]:
+            "NEMOTRON_VPOWERFUL_MODEL"]:
     v = os.getenv(var)
     print(f"{var}: {'SET (len=%d)' % len(v) if v else 'MISSING'}")
 # --- Output config ---
@@ -82,7 +82,6 @@ NEMOTRON_ULTRA_MODEL = os.getenv("NEMOTRON_ULTRA_MODEL")
 NEMOTRON_LIGHTNING_MODEL = os.getenv("NEMOTRON_LIGHTNING_MODEL")
 NIM_POWERFUL_MODEL = os.getenv("NIM_POWERFUL_MODEL")
 NIM_VPOWERFUL_MODEL = os.getenv("NIM_VPOWERFUL_MODEL")
-NIM_ULTRA_POWERFUL_MODEL = os.getenv("NIM_ULTRA_POWERFUL_MODEL")
 MODEL_CHAIN = [
     m for m in [
         {"model": NIM_VPOWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
