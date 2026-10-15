@@ -10,6 +10,28 @@
 4. Writes only validated briefs to disk. Raw API responses archived to
    ./llm_debug/ for forensics.
   No intermediate JSON file required — feed fetching is built in.
+
+  ==============================================================================
+  FETCH-STRATEGY NOTES (FT HTTP 429 remediation)
+  ==============================================================================
+  R1. Polite pause always runs, including on the failure path. Previously the
+      sleep sat after a `continue`, so a failed fetch skipped it entirely and
+      the script fired ~20 requests in 3.2s once FT started refusing.
+  R2. Per-host minimum spacing. FT is paced deliberately slowly (8s base);
+      other publishers use a light 0.35s courtesy gap.
+  R3. Adaptive backoff. On a 429 a host's spacing triples (capped) and decays
+      back toward its base after successes. Recovers on its own.
+  R4. Circuit breaker is HALF-OPEN, not permanent. After N consecutive 429s a
+      host is skipped only for COOLDOWN seconds, then probed once. If the host
+      recovers, harvesting resumes. Strike state is per-host, so a throttle at
+      one publisher can never open another publisher's breaker.
+  R5. ETag / Last-Modified conditional GETs + TTL disk cache.
+  R6. Honest, contactable User-Agent.
+  R7. FT feed tiering: must-have feeds always fetched; the rest only if
+      must-have coverage falls short of a threshold.
+
+  Verified NOT used: ft-rss.herokuapp.com (Heroku free-tier shutdown, 502) and
+  FiveFilters Full-Text RSS (free hosted service discontinued by its operator).
 ================================================================================
 """
 import os
@@ -28,6 +50,7 @@ from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
 import urllib.request
+import urllib.parse
 import urllib.error
 from urllib.error import HTTPError
 try:
@@ -76,12 +99,58 @@ LLM_REQUEST_TIMEOUT = 300
 # --- INPUT SIZE GUARDS ---
 MAX_CHARS_PER_ITEM = 500
 INPUT_CHAR_BUDGET = 100_000
-# --- FEED FETCH GUARDS ---
+# ==============================================================================
+# FETCH PACING CONFIG  (R2 / R3 / R4)
+# ==============================================================================
+# This job runs once per day, so pacing is deliberately conservative and the
+# settings are plain constants rather than .env knobs. Edit them in-code.
 FEED_TIMEOUT = 15
-FEED_PAUSE_RANGE = (0.3, 0.8)   # polite pause between feed requests
-# --- THINKING MODE ---
+# Minimum seconds between two requests to the SAME host, keyed by hostname
+# suffix. Anything not listed falls through to DEFAULT_HOST_DELAY.
+#
+# FT is the only host observed to throttle aggressively (26/26 failures while
+# every other publisher succeeded), so it gets its own slow pace. 8s base means
+# the 12 must-have FT feeds take roughly two minutes — trivial for a daily run
+# and comfortably under any sane per-minute allowance.
+FEED_HOST_DELAY = {
+    "ft.com": 8.0,
+}
+DEFAULT_HOST_DELAY = 0.35
+# Jitter ceiling per host, so the request pattern is not metronomic.
+FEED_HOST_JITTER = {
+    "ft.com": 1.5,
+}
+DEFAULT_HOST_JITTER = 0.35
+# Short unconditional courtesy pause after every attempt, success or failure.
+# _throttle() is the real limiter; this is just belt-and-braces politeness.
+FEED_COURTESY_SLEEP = (0.05, 0.25)
+# Ceiling for adaptive backoff (R3). FT spacing triples per 429 up to here.
+MAX_HOST_DELAY = 45.0
+BACKOFF_FACTOR = 3.0
+BACKOFF_DECAY = 0.80          # shrink toward base on each success
+MIN_BACKOFF_WAIT = 15         # floor when honouring a 429
+MAX_BACKOFF_WAIT = 60
+# Circuit breaker (R4). Consecutive 429s before a host goes quiet; it is NOT
+# skipped for the rest of the run, only for COOLDOWN seconds, after which one
+# probe is allowed. A throttled host that recovers will rejoin the harvest.
+BREAKER_429_THRESHOLD = 3
+BREAKER_COOLDOWN = 120
+# Conditional-GET / TTL cache (R5). cwd-relative, matching this script's other
+# output paths.
+FEED_CACHE_DIR = Path("feed_cache")
+FEED_CACHE_TTL_SECONDS = 20 * 60
+# Tiering (R7): only pull nice-to-have feeds if must-have coverage is thin.
+TIER2_MIN_ARTICLES = 150
+# Contact string for the User-Agent. A real address can help you get treated
+# more leniently; leave the placeholder if you don't want to publish one.
+FEED_CONTACT = "fake_email@proton.me"
+# ==============================================================================
+# THINKING MODE
+# ==============================================================================
 NO_THINK_KWARG = True
-# --- OUTPUT VALIDATION GATE ---
+# ==============================================================================
+# OUTPUT VALIDATION GATE
+# ==============================================================================
 MIN_BRIEF_CHARS = 600
 MIN_WORD_RATIO = 0.60
 REQUIRED_HEADERS = ["NEWS INTELLIGENCE BRIEF"]
@@ -94,27 +163,27 @@ FEEDS = {
     "FT: Markets": "https://www.ft.com/markets?format=rss",
     "FT: Global Economy": "https://www.ft.com/global-economy?format=rss",
     "FT: Emerging Markets": "https://www.ft.com/emerging-markets?format=rss",
-    "FT: Opinion": "https://www.ft.com/opinion?format=rss",
     "FT: World": "https://www.ft.com/world?format=rss",
-    "FT: UK": "https://www.ft.com/uk?format=rss",
     "FT: US": "https://www.ft.com/us?format=rss",
     "FT: Companies": "https://www.ft.com/companies?format=rss",
+    "FT: Technology": "https://www.ft.com/technology?format=rss",
+    "FT: China": "https://www.ft.com/china?format=rss",
+    "FT: Europe": "https://www.ft.com/world/europe?format=rss",
+    "FT: Americas": "https://www.ft.com/world/americas?format=rss",
+    "FT: Asia-Pacific": "https://www.ft.com/world/asia-pacific?format=rss",
+    # --- FT nice-to-have: fetched only if must-have coverage is thin (R7) ---
+    "FT: Opinion": "https://www.ft.com/opinion?format=rss",
     "FT: Energy": "https://www.ft.com/energy?format=rss",
     "FT: Climate Capital": "https://www.ft.com/climate-capital?format=rss",
     "FT: Work & Careers": "https://www.ft.com/work-careers?format=rss",
     "FT: Financials": "https://www.ft.com/financials?format=rss",
-    "FT: Technology": "https://www.ft.com/technology?format=rss",
     "FT: Health": "https://www.ft.com/health?format=rss",
     "FT: Industrials": "https://www.ft.com/industrials?format=rss",
     "FT: Media": "https://www.ft.com/media?format=rss",
     "FT: Professional Services": "https://www.ft.com/professional-services?format=rss",
     "FT: Retail & Consumer": "https://www.ft.com/retail-consumer?format=rss",
     "FT: Telecoms": "https://www.ft.com/telecoms?format=rss",
-    "FT: China": "https://www.ft.com/china?format=rss",
     "FT: Africa": "https://www.ft.com/africa?format=rss",
-    "FT: Europe": "https://www.ft.com/world/europe?format=rss",
-    "FT: Americas": "https://www.ft.com/world/americas?format=rss",
-    "FT: Asia-Pacific": "https://www.ft.com/world/asia-pacific?format=rss",
     "FT: Middle East & North Africa": "https://www.ft.com/world/middle-east-north-africa?format=rss",
     # ─── Wall Street Journal ───
     "WSJ: World News": "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
@@ -175,32 +244,267 @@ FEEDS = {
     "WaPo: Technology": "https://feeds.washingtonpost.com/rss/technology",
     "WaPo: Politics": "https://feeds.washingtonpost.com/rss/politics",
 }
+# ─── Must-have feeds (always fetched) ───
+# Your 12 FT sections, plus every non-FT publisher. Only FT is tiered.
+MUST_HAVE_FEEDS = {
+    "FT: Home (International)", "FT: Markets", "FT: Global Economy",
+    "FT: Emerging Markets", "FT: World", "FT: US", "FT: Companies",
+    "FT: Technology", "FT: China", "FT: Europe", "FT: Americas",
+    "FT: Asia-Pacific",
+}
+MUST_HAVE_FEEDS.update({k for k in FEEDS if not k.startswith("FT: ")})
+
+
+def is_must_have(feed_name: str) -> bool:
+    return feed_name in MUST_HAVE_FEEDS
+
+
 # ==============================================================================
 # LOGGING
 # ==============================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] - %(message)s')
 logger = logging.getLogger("RSSIntelHarvester")
 # ==============================================================================
-# HTTP & UTILS
+# HOST STATE  (per-host pacing, backoff, breaker)
 # ==============================================================================
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive"
-}
-def http_get(url: str, timeout=30) -> bytes:
-    """GET with gzip handling; returns raw bytes (needed for XML)."""
+@dataclass
+class HostState:
+    """Per-host request budget. One of these per hostname, never global."""
+    host: str
+    base_delay: float
+    jitter: float
+    delay: float = 0.0
+    strikes: int = 0              # consecutive 429s
+    successes: int = 0
+    last_request: float = 0.0     # monotonic timestamp
+    tripped_at: Optional[float] = None   # monotonic; None = breaker closed
+
+    def __post_init__(self):
+        self.delay = self.base_delay
+
+    @property
+    def cooling(self) -> bool:
+        return self.tripped_at is not None
+
+    def cooldown_remaining(self) -> int:
+        if self.tripped_at is None:
+            return 0
+        return max(0, int(BREAKER_COOLDOWN - (time.monotonic() - self.tripped_at)))
+
+    def note_success(self) -> None:
+        self.strikes = 0
+        self.successes += 1
+        self.tripped_at = None
+        if self.delay > self.base_delay:
+            self.delay = max(self.base_delay, self.delay * BACKOFF_DECAY)
+
+    def note_throttled(self) -> None:
+        self.strikes += 1
+        self.delay = min(MAX_HOST_DELAY, max(self.delay * BACKOFF_FACTOR,
+                                             self.base_delay * BACKOFF_FACTOR))
+        if self.strikes >= BREAKER_429_THRESHOLD:
+            self.tripped_at = time.monotonic()
+
+    def note_failure(self) -> None:
+        """A non-429 failure does not penalize the host's pacing."""
+        pass
+
+    def reset_for_run(self) -> None:
+        self.strikes = 0
+        self.tripped_at = None
+        self.delay = self.base_delay
+
+
+_HOSTS: dict = {}
+
+
+def host_of(url: str) -> str:
     try:
-        req = urllib.request.Request(url, headers=HEADERS)
+        return (urllib.parse.urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _lookup_suffix(host: str, table: dict) -> Optional[float]:
+    for suffix, val in table.items():
+        if host == suffix or host.endswith("." + suffix):
+            return val
+    return None
+
+
+def get_host_state(url: str) -> HostState:
+    """Fetch (or lazily create) the HostState for this URL's host."""
+    host = host_of(url)
+    if host not in _HOSTS:
+        base = _lookup_suffix(host, FEED_HOST_DELAY)
+        jit = _lookup_suffix(host, FEED_HOST_JITTER)
+        _HOSTS[host] = HostState(
+            host=host,
+            base_delay=DEFAULT_HOST_DELAY if base is None else base,
+            jitter=DEFAULT_HOST_JITTER if jit is None else jit,
+        )
+    return _HOSTS[host]
+
+
+def reset_host_states() -> None:
+    for st in _HOSTS.values():
+        st.reset_for_run()
+
+
+def _throttle(st: HostState) -> None:
+    """Block until this host's current inter-request gap has elapsed."""
+    gap = st.delay + random.uniform(0, st.jitter)
+    if st.last_request:
+        wait = gap - (time.monotonic() - st.last_request)
+        if wait > 0:
+            time.sleep(wait)
+    st.last_request = time.monotonic()
+
+
+# ==============================================================================
+# HTTP
+# ==============================================================================
+# R6: identify honestly. The spoofed Firefox string was inaccurate and, on
+# some hosts, itself a reason to apply stricter anonymous-client limits.
+HEADERS = {
+    "User-Agent": f"RSSIntelHarvester/2.0 (+{FEED_CONTACT})",
+    "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "close",
+}
+
+
+@dataclass
+class FetchResult:
+    """Fetch outcome carrying status + headers so 429/Retry-After is visible."""
+    status: int
+    body: bytes = b""
+    etag: str = ""
+    last_modified: str = ""
+    from_cache: bool = False
+    error: str = ""
+    retry_after: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.status == 200 and bool(self.body)
+
+
+def _cache_paths(url: str) -> tuple:
+    key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
+    return (FEED_CACHE_DIR / f"{key}.xml", FEED_CACHE_DIR / f"{key}.meta.json")
+
+
+def _cache_read(url: str) -> tuple:
+    """Return (body, etag, last_modified) if a fresh-enough entry exists."""
+    body_p, meta_p = _cache_paths(url)
+    try:
+        if not body_p.exists() or not meta_p.exists():
+            return None, "", ""
+        meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        if time.time() - meta.get("ts", 0) > FEED_CACHE_TTL_SECONDS:
+            return None, "", ""
+        return body_p.read_bytes(), meta.get("etag", ""), meta.get("last_modified", "")
+    except Exception:
+        return None, "", ""
+
+
+def _cache_write(url: str, body: bytes, etag: str, last_modified: str) -> None:
+    body_p, meta_p = _cache_paths(url)
+    try:
+        FEED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        body_p.write_bytes(body)
+        meta_p.write_text(json.dumps({
+            "ts": time.time(), "url": url,
+            "etag": etag, "last_modified": last_modified,
+        }), encoding="utf-8")
+    except Exception as e:
+        logger.debug(f"Cache write failed: {e}")
+
+
+def http_get(url: str, timeout=30) -> FetchResult:
+    """GET with gzip handling, conditional revalidation, real status codes."""
+    cached_body, cached_etag, cached_lm = _cache_read(url)
+
+    # Fresh cache hit inside TTL with nothing to revalidate: skip the network.
+    if cached_body is not None and not (cached_etag or cached_lm):
+        return FetchResult(200, cached_body, cached_etag, cached_lm, from_cache=True)
+
+    headers = dict(HEADERS)
+    if cached_etag:
+        headers["If-None-Match"] = cached_etag
+    if cached_lm:
+        headers["If-Modified-Since"] = cached_lm
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read()
             if resp.info().get('Content-Encoding') == 'gzip' or data.startswith(b'\x1f\x8b'):
                 data = gzip.decompress(data)
-            return data
+            etag = resp.headers.get("ETag", "") or ""
+            last_mod = resp.headers.get("Last-Modified", "") or ""
+            _cache_write(url, data, etag, last_mod)
+            return FetchResult(200, data, etag, last_mod)
+    except HTTPError as e:
+        # 304: our cached copy is still authoritative. Refresh TTL so the next
+        # run short-circuits without touching the network.
+        if e.code == 304 and cached_body is not None:
+            _cache_write(url, cached_body, cached_etag, cached_lm)
+            return FetchResult(200, cached_body, cached_etag, cached_lm, from_cache=True)
+        retry_after = 0
+        try:
+            hdr = e.headers.get("Retry-After", "") if e.headers else ""
+            if hdr and hdr.strip().isdigit():
+                retry_after = int(hdr.strip())
+        except Exception:
+            retry_after = 0
+        return FetchResult(e.code, b"", error=f"HTTP {e.code} {e.reason}",
+                           retry_after=retry_after)
     except Exception as e:
-        logger.error(f"HTTP Fail [{url}]: {e}")
-        return b""
+        return FetchResult(0, b"", error=str(e))
+
+
+def fetch_feed(url: str) -> FetchResult:
+    """Fetch one feed with host-aware pacing and a single 429 retry."""
+    st = get_host_state(url)
+
+    _throttle(st)
+    res = http_get(url, timeout=FEED_TIMEOUT)
+    st.last_request = time.monotonic()
+
+    if res.ok:
+        st.note_success()
+        return res
+
+    if res.status != 429:
+        st.note_failure()
+        return res
+
+    # --- 429: back off, retry this feed exactly once ---
+    st.note_throttled()
+    wait = res.retry_after or int(min(MAX_BACKOFF_WAIT,
+                                      max(MIN_BACKOFF_WAIT, st.delay)))
+    wait = min(MAX_BACKOFF_WAIT, wait)
+    logger.warning(f"[429] {st.host}: throttled (strike {st.strikes}, "
+                   f"next spacing ~{st.delay:.1f}s). Honouring Retry-After="
+                   f"{res.retry_after or wait}s.")
+    time.sleep(wait)
+
+    _throttle(st)
+    res = http_get(url, timeout=FEED_TIMEOUT)
+    st.last_request = time.monotonic()
+
+    if res.ok:
+        st.note_success()
+    elif res.status == 429:
+        st.note_throttled()
+        logger.warning(f"[429] {st.host}: still throttled after {wait}s wait.")
+    else:
+        st.note_failure()
+    return res
+
+
 # ==============================================================================
 # DATE PARSING
 # ==============================================================================
@@ -290,40 +594,106 @@ def parse_feed(xml_content: bytes, feed_name: str) -> list[Article]:
                 articles.append(Article(guid or link, title, link, pub_date, summary, feed_name, publication))
     return articles
 # ==============================================================================
-# HARVEST: fetch all feeds -> dedupe -> date filter
+# HARVEST
 # ==============================================================================
+def _absorb(feed_name: str, content: bytes, all_articles: dict, allowed: set) -> int:
+    articles = parse_feed(content, feed_name)
+    kept = 0
+    for art in articles:
+        if art.pub_date.date() not in allowed:
+            continue
+        key = art.guid or art.link
+        if key not in all_articles:
+            all_articles[key] = art
+            kept += 1
+    print(f"    ✓ {feed_name}: {len(articles)} fetched, {kept} in window")
+    return len(articles)
+
+
 def harvest_feeds() -> list[Article]:
-    """Fetch all feeds, dedupe by GUID, filter to today + yesterday (UTC)."""
+    """Fetch feeds in tiers, dedupe by GUID, filter to today + yesterday (UTC)."""
+    reset_host_states()
+
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     today = now_utc.date()
     yesterday = (now_utc - datetime.timedelta(days=1)).date()
     allowed = {today, yesterday}
-    all_articles: dict[str, Article] = {}
-    pubs = {}
+
+    all_articles: dict = {}
+    pubs: dict = {}
     for name, url in FEEDS.items():
         pubs.setdefault(name.split(":")[0], []).append((name, url))
-    total_raw = 0
-    for pub, feeds in pubs.items():
-        print(f"  ── {pub} ({len(feeds)} feeds) ──")
-        for feed_name, url in feeds:
-            content = http_get(url, timeout=FEED_TIMEOUT)
-            if not content:
-                print(f"    ✗ {feed_name}: fetch failed")
+
+    def sweep(select, label):
+        total_raw = 0
+        for pub, entries in pubs.items():
+            todo = [(n, u) for n, u in entries if select(n)]
+            if not todo:
                 continue
-            articles = parse_feed(content, feed_name)
-            # date filter + dedupe
-            kept = 0
-            for art in articles:
-                total_raw += 1
-                if art.pub_date.date() not in allowed:
-                    continue
-                key = art.guid or art.link
-                if key not in all_articles:
-                    all_articles[key] = art
-                    kept += 1
-            print(f"    ✓ {feed_name}: {len(articles)} fetched, {kept} in window")
-            time.sleep(random.uniform(*FEED_PAUSE_RANGE))
-    logger.info(f"Harvest: {total_raw} raw items, {len(all_articles)} unique in today/yesterday window.")
+            print(f"  ── {pub} ({len(todo)} feeds{label}) ──")
+            for feed_name, url in todo:
+                st = get_host_state(url)
+
+                # --- half-open breaker: skip only while cooling down ---
+                if st.cooling:
+                    left = st.cooldown_remaining()
+                    if left > 0:
+                        print(f"    ⏸ {feed_name}: {st.host} in backoff "
+                              f"({left}s remaining, resumes after cooldown)")
+                        continue
+                    logger.info(f"[breaker] {st.host}: cooldown elapsed, probing again.")
+                    st.tripped_at = None
+
+                try:
+                    res = fetch_feed(url)
+
+                    if res.ok:
+                        total_raw += _absorb(feed_name, res.body, all_articles, allowed)
+                        if res.from_cache:
+                            print("       ↺ served from cache (no network request)")
+                        if st.delay > st.base_delay * 1.05:
+                            print(f"       ⇅ {st.host} spacing relaxing toward "
+                                  f"{st.base_delay:.1f}s")
+                    elif res.status == 429:
+                        if st.cooling:
+                            print(f"    ✗ {feed_name}: 429 — {st.host} cooling "
+                                  f"down {st.cooldown_remaining()}s")
+                        else:
+                            print(f"    ✗ {feed_name}: 429 throttled")
+                    else:
+                        print(f"    ✗ {feed_name}: fetch failed "
+                              f"({res.error or res.status})")
+                finally:
+                    # R1: unconditional courtesy pause, success or failure.
+                    time.sleep(random.uniform(*FEED_COURTESY_SLEEP))
+        return total_raw
+
+    # ── Pass 1: must-have ──
+    total_raw = sweep(is_must_have, "")
+
+    # ── Pass 2: nice-to-have only if coverage is thin (R7) ──
+    if len(all_articles) < TIER2_MIN_ARTICLES:
+        logger.info(f"Coverage {len(all_articles)} < {TIER2_MIN_ARTICLES}; "
+                    f"pulling nice-to-have feeds.")
+        total_raw += sweep(lambda n: not is_must_have(n), ", 2nd tier")
+    else:
+        logger.info(f"Coverage {len(all_articles)} >= {TIER2_MIN_ARTICLES}; "
+                    f"skipping nice-to-have feeds.")
+
+    degraded = sorted(h for h, s in _HOSTS.items()
+                      if s.strikes > 0 or s.cooling or not s.successes)
+    logger.info(f"Harvest: {total_raw} raw items, {len(all_articles)} unique "
+                f"in today/yesterday window.")
+    logger.info(f"Host pacing report: {len(_HOSTS)} hosts touched.")
+    for h in sorted(_HOSTS):
+        s = _HOSTS[h]
+        if s.strikes or s.cooling or s.delay > s.base_delay * 1.05:
+            logger.info(f"  - {h}: {s.successes} ok, {s.strikes} strikes, "
+                        f"spacing now {s.delay:.1f}s (base {s.base_delay:.1f}s)"
+                        + (f", COOLING {s.cooldown_remaining()}s" if s.cooling else ""))
+    if degraded:
+        logger.warning(f"Hosts that throttled or failed this run: {degraded}")
+
     return sorted(all_articles.values(), key=lambda a: a.pub_date, reverse=True)
 # ==============================================================================
 # SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF
@@ -497,6 +867,7 @@ def main():
     budget = {"left": INPUT_CHAR_BUDGET}
     stats = {"kept": 0, "dropped": 0}
     lines = []
+    kept_articles = []   # FIX: track the items actually kept, for accurate pub counts
     for art in articles:
         pub = art.publication
         title = art.title.strip()
@@ -514,9 +885,14 @@ def main():
         budget["left"] -= cost
         stats["kept"] += 1
         lines.append(line)
+        kept_articles.append(art)
     logger.info(f"[Prompt] Kept {stats['kept']} items ({stats['dropped']} dropped by budget).")
+    # FIX: count publications over the kept set only. Previously this sliced
+    # `articles[:stats["kept"]]`, which counted the first N sorted articles
+    # rather than the ones that actually fit the budget — so dropped items
+    # could be counted and kept items omitted.
     pubs = {}
-    for art in articles[:stats["kept"]]:
+    for art in kept_articles:
         pubs[art.publication] = pubs.get(art.publication, 0) + 1
     pub_summary = ", ".join(f"{k}: {v}" for k, v in sorted(pubs.items()))
     user_prompt = "\n\n".join([
