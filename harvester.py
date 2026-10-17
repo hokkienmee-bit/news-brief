@@ -34,7 +34,7 @@
   FiveFilters Full-Text RSS (free hosted service discontinued by its operator).
 
   ==============================================================================
-  LLM PIPELINE STRATEGY  (v3, carried forward unchanged through v8)
+  LLM PIPELINE STRATEGY  (v3, carried forward unchanged through v9)
   ==============================================================================
   L1. PER-MODEL TUNING. `MAX_OUTPUT_TOKENS` / `LLM_TEMPERATURE` are gone.
       Each model gets `(max_output_tokens, temperature, timeout)` from
@@ -98,15 +98,13 @@
        change what order the reachable models are tried in. An unknown model
        sorts last rather than being dropped. Ties keep registration order.
 
-       CONFIRMED on the 2026-10-17 08:32 run: with Step 5 Preview in the
-       ULTRA_POWERFUL slot and GLM in VPOWERFUL (i.e. pre-swap), the log read
-       `Chain order: 1.glm -> 2.step-5-preview`. That is correct — identity
-       said GLM was priority 2 and nothing matched priority 1, because that
-       run's secrets had not yet been swapped. Once Step 5 Preview is in the
-       VPOWERFUL slot as intended, the same table yields
-       `1.stepfun-ai/step-5-preview -> 2.z-ai/glm-5.3-flash`, which is the
-       required order. No code change was needed for the swap; that is the
-       point of L10.
+       CONFIRMED twice now. The 2026-10-17 08:32 run (`1.glm -> 2.step-5-preview`)
+       was the v6/v7 slot-ordered code with GLM in the VPOWERFUL slot — GLM led
+       because of the slot, which is the bug v8 was written to fix. The 2026-10-17
+       12:xx run of v8 (`1.stepfun-ai/step-5-preview -> 2.z-ai/glm-5.3-flash`)
+       proved identity ordering honours the intent regardless of slot. Both
+       mechanisms are correct per their own design; only the identity one
+       survives a secret swap.
 
   FEEDS. WaPo dropped — five feeds returned four 502s and one 404 on three
   consecutive runs; that is a dead endpoint, not flakiness, and the 429-only
@@ -153,11 +151,11 @@
        "high"`); the top-level form I described in prose was wrong, and the
        nested form is what is implemented here.
 
-       GLM now requests `low`, with `high` as the next step up if quality
-       drops. The operator's config uses `high` — a reasonable landing point,
-       but `low` is the better first probe because it fails loudly if too
-       weak, whereas `high` risks reproducing the 62.4s / 131k-char behaviour
-       more slowly and less legibly.
+       GLM requests `low`, with `high` as the next step up if quality drops.
+       The operator's litellm config uses `high` — a reasonable landing point,
+       but `low` is the better first probe because it fails loudly if too weak,
+       whereas `high` risks reproducing the 62.4s / 131k-char behaviour more
+       slowly and less legibly.
 
        `clear_thinking: false` appears in the operator's litellm config but
        nowhere in NVIDIA's published docs, so it is deliberately NOT sent.
@@ -170,9 +168,33 @@
        not a target, so an unspent allowance costs nothing while a tight one
        converts a working model into a `finish_reason=length` failure.
 
-  v8's corrections (the three transcription defects) are carried forward
-  fixed. `MODEL_PRIORITY`, `SYSTEM_PROMPT`, the feed list, streaming, and the
-  retry logic are unchanged.
+  ==============================================================================
+  v10 — GLM BECOMES THE PRIMARY MODEL  (2026-10-17, operator decision)
+  ==============================================================================
+  The operator re-christened the slots: GLM-5.3-Flash is now "ULTRA POWERFUL"
+  and Step 5 Preview is now "VPOWERFUL", and asked that GLM go first. This is
+  the reverse of the v6 ordering, which placed Step 5 first on latency grounds
+  (it answered in 690s; GLM's ttfb on the same payload was 62.4s before it had
+  emitted a single answer token).
+
+  That reversal deserves stating plainly rather than quietly accepting: a
+  run where GLM leads means every brief now waits on the slower model first,
+  including the days Step 5 would have answered. The cost is measured in
+  wall-clock, and it is real. The operator's rationale — that GLM is "really
+  good" in a way Nemotron was not — is a quality argument, and quality has
+  more right to be argued about than a table of constants does.
+
+  The implementation is deliberate about one thing: the ordering line changed
+  and NOTHING else moved. Not the tuning, not the budget, not the timeout,
+  not the thinking controls. That is what L10 was for. Because order comes
+  from model identity, a two-number edit in MODEL_PRIORITY reverses the chain
+  while leaving every per-model parameter attached to the right model — the
+  opposite of the v6/v7 code, where the same reversal required editing a
+  hardcoded list whose position and meaning were the same thing.
+
+  The secret slots no longer matter to behaviour. GLM sits in whichever slot,
+  Step 5 in whichever slot; the chain order is decided by `MODEL_PRIORITY`.
+  The names are now purely human labels, which is the correct role for them.
 ================================================================================
 """
 import os
@@ -233,9 +255,9 @@ NIM_VPOWERFUL_MODEL = os.getenv("NIM_VPOWERFUL_MODEL")
 # entry arrived in carries no meaning: reassigning which secret holds which
 # model changes what is REACHABLE, never what ORDER the models are tried in.
 #
-# v8 replaced the old hardcoded `MODEL_CHAIN` list — which was in slot order and
-# thereby silently made GLM primary when the two slots were swapped — with this
-# list plus `MODEL_PRIORITY` below.
+# The two names the operator re-christened in v10 are now pure labels. GLM is
+# "ULTRA POWERFUL" and Step 5 Preview is "VPOWERFUL", but since v8 the slot a
+# model occupies has had no bearing on when it is called — see MODEL_PRIORITY.
 _MODEL_SOURCES = [
     {"model": NIM_VPOWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
     {"model": NIM_ULTRA_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
@@ -251,20 +273,24 @@ _MODEL_SOURCES = [
 # WINS in the order written — so a more specific key must precede a more
 # general one. Lower number = tried earlier.
 #
-# Required order, stated by the operator and encoded here: STEP 5 PREVIEW
-# FIRST, THEN GLM-5.3-FLASH. Placement rationale. Step 5 Preview leads because
-# latency, not quality, is what the daily job cares about — it answered
-# correctly in 690s and produced a 34,194-character brief. GLM-5.3-Flash sits
-# at position 2 because it is the best model reachable when Step 5 is not: good
-# enough that you want it over Nemotron, slow enough that you do not want it
-# first. Behind the primary it costs nothing on the days Step 5 answers.
+# v10 ORDER, as the operator directed: GLM-5.3-FLASH FIRST, STEP 5 PREVIEW
+# SECOND. This reverses the v6 placement, which put Step 5 first because it
+# answered in 690s where GLM needed 62.4s merely to start. The re-reversal is
+# a quality decision and it is recorded as one: GLM is the best-performing
+# model this workflow has run, and the operator prefers to try it first and
+# let Step 5 catch the days it does not.
 #
-# Nemotron is the family default at 3: ultra, lightning and super share the
-# substring, so they keep their mutual order from `_MODEL_SOURCES` (the tie
-# broken by registration order, for determinism).
+# The consequence, stated rather than buried: every brief now waits on the
+# slower model first, including days Step 5 would have answered. That is the
+# deliberate cost of putting quality ahead of latency in this slot.
+#
+# If this is ever reversed again, change the two numbers below and nothing
+# else. That is the entire purpose of L10 — v6/v7 required editing a hardcoded
+# list whose position and meaning were the same thing, which is how the
+# 2026-10-17 08:32 run ended up with GLM primary by accident.
 MODEL_PRIORITY = [
-    {"match": "step-5-preview", "priority": 1},    # primary — outer reasoning model
-    {"match": "glm", "priority": 2},               # intermediate — forced thinking
+    {"match": "glm", "priority": 1},               # primary — forced thinking, best output
+    {"match": "step-5-preview", "priority": 2},    # fallback — fast, 690s, correct
     {"match": "nemotron", "priority": 3},          # family — ultra / lightning / super
 ]
 
@@ -358,18 +384,22 @@ RETRY_TOKEN_MULTIPLIER = 2
 #   `enable_thinking` (see `NO_THINK_MODEL_KEYWORDS`), and sending it a
 #   reasoning_effort it does not implement is an HTTP 400.
 #
+# v10: this table is matched against the MODEL ID, not against which secret the
+# model arrived in, and not against its chain position either. Reordering
+# MODEL_PRIORITY cannot re-tune a model, which is the point — v6/v7 would have
+# coupled the two.
+#
 # v7/v12: `max_output_tokens` is a CEILING, NOT A TARGET. Every model that has
 # not yet been observed in production gets the most generous budget we are
 # willing to afford rather than the smallest budget we think it needs. An
 # unused allowance is simply unspent; a tight ceiling converts a model that was
 # going to succeed into a `finish_reason=length` failure and a fall through to
 # the next model.
-#
-# v8: this table is matched against the MODEL ID, not against which secret the
-# model arrived in — the same protection `MODEL_PRIORITY` gives ordering. So
-# swapping secrets can no longer mis-tune a model either.
 MODEL_TUNING = [
     {
+        # GLM is now the primary call (v10). Headroom matters more at position
+        # 1 than at position 2, because a failed primary costs the run the
+        # time it spent failing before the fallback even starts.
         "match": "step-5-preview",
         "max_output_tokens": 32000,
         "temperature": 1.0,
@@ -395,10 +425,11 @@ MODEL_TUNING = [
         # temperature 0.1 -> 1.0, per GLM's card. 0.1 was our house default
         # imposed on a model that specifies otherwise.
         #
-        # The 1800s timeout is retained: the last call ran 17m43s comfortably
-        # inside it, and with streaming a long generation costs wall-clock,
-        # not correctness. `clear_thinking: false` appears in the operator's
-        # litellm config but in no NVIDIA doc, so it is deliberately not sent.
+        # The 1800s timeout is retained and is now load-bearing rather than
+        # incidental: GLM is the primary call, so a timeout that cuts it off
+        # costs the run directly rather than merely delaying the fallback.
+        # `clear_thinking: false` appears in the operator's litellm config but
+        # in no NVIDIA doc, so it is deliberately not sent.
         "match": "glm",
         "max_output_tokens": 65536,
         "temperature": 1.0,
@@ -509,6 +540,9 @@ NO_THINK_KWARG = True
 # instead. GLM is deliberately NOT listed below, and that omission is now a
 # considered decision rather than a misclassification: the entry that would
 # send `chat_template_kwargs: {"enable_thinking": False}` is unavailable to it.
+#
+# v10: this is unchanged by GLM becoming primary. Thinking mode is a property
+# of the model, not of its position in the chain.
 NO_THINK_MODEL_KEYWORDS = ["nemotron"]
 # ==============================================================================
 # OUTPUT VALIDATION GATE
@@ -1075,7 +1109,7 @@ def harvest_feeds() -> list[Article]:
 
     return sorted(all_articles.values(), key=lambda a: a.pub_date, reverse=True)
 # ==============================================================================
-# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF   (v4 policy, retained in v5–v9)
+# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF   (v4 policy, retained in v5–v10)
 # ==============================================================================
 # v4 change: human-interest and lifestyle items were promoted to first-class
 # content and romantic/sexual relationship coverage excluded.
@@ -1088,7 +1122,7 @@ def harvest_feeds() -> list[Article]:
 # instruction rather than by data.
 #
 # v5 edits to this prompt are limited to the two source lists, because WaPo is
-# no longer fetched (see the v5 feed removals above). v6 through v9 change
+# no longer fetched (see the v5 feed removals above). v6 through v10 change
 # nothing here — the balance policy and the romance exclusion are
 # model-agnostic and were deliberately left untouched by model-chain changes.
 SYSTEM_PROMPT = """
@@ -1269,6 +1303,9 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str,
         # GLM is deliberately absent from `NO_THINK_MODEL_KEYWORDS` (see the
         # note there): it is not that GLM has no thinking mode to disable, it is
         # that disabling is not available to it. Effort is the only knob.
+        #
+        # v10: unchanged by GLM becoming primary. Thinking control is a property
+        # of the model, not of its position in the chain.
         template_kwargs: dict = {}
         if NO_THINK_KWARG and any(kw in model.lower() for kw in NO_THINK_MODEL_KEYWORDS) \
                 and "nvidia" in base_url:
@@ -1354,10 +1391,6 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str,
         content, finish, reasoning, ttfb = send_stream(payload)
         streamed = True
     except HTTPError as e:
-        # A 400 here may mean the endpoint rejected `chat_template_kwargs`
-        # outright rather than a specific key inside it. Both the whole-dict
-        # removal below and the per-key removal in `_retry_without_chat_kwargs`
-        # are tried, because a rejection of one key should not cost the model.
         if NO_THINK_KWARG and e.code in (400, 422) and "chat_template_kwargs" in payload:
             logger.info(f"[LLM] {model}: endpoint rejected chat_template_kwargs; "
                         f"retrying streamed without.")
