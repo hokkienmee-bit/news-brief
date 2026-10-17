@@ -34,7 +34,7 @@
   FiveFilters Full-Text RSS (free hosted service discontinued by its operator).
 
   ==============================================================================
-  LLM PIPELINE STRATEGY  (v3, carried forward unchanged through v5)
+  LLM PIPELINE STRATEGY  (v3, carried forward unchanged through v8)
   ==============================================================================
   L1. PER-MODEL TUNING. `MAX_OUTPUT_TOKENS` / `LLM_TEMPERATURE` are gone.
       Each model gets `(max_output_tokens, temperature, timeout)` from
@@ -65,35 +65,19 @@
       puzzles. If a model's budget needs changing, you change one number in
       one place and the startup banner prints what it resolved to.
 
-  ==============================================================================
-  v5 — WHAT CHANGED AND WHY  (2026-10-17, after script_ran_but_no_step5.txt)
-  ==============================================================================
-  The Step 5 failure was NOT a timeout and NOT a token budget. Both attempts
-  died at ~273s and ~276s against a 900s ceiling, with
-  `RemoteDisconnected` — which is `http.client.RemoteDisconnected`, raised
-  when the PEER closes the connection before any HTTP response byte arrives.
-  A client timeout raises a different exception from a different layer.
-
-  Cause: `stream: False`. Step 5 is a reasoning model; on a ~25k-token news
-  dump it computes for minutes before its first output token. With no bytes
-  in flight, the gateway's idle limit closes the socket long before the model
-  finishes. Raising request_timeout therefore buys nothing — you were never
-  waiting on it.
-
   L6. SSE STREAMING (`stream: True`) with delta accumulation. Bytes flow from
       the first token onward, so the connection is never idle and the gateway
-      limit is never reached. Time-to-first-byte is logged, which is the number
-      that confirms or kills this theory on the next run. If an endpoint
-      rejects `stream=true` (HTTP 400/422) the call retries non-streamed, and
-      if streaming fails at the transport level the retry loop falls back to
-      `stream=False`, so a streaming-hostile endpoint degrades instead of
-      losing the model.
+      limit is never reached. Time-to-first-byte is logged.
 
-  CONFIRMED on the 2026-10-17 06:52 run. The primary model returned
-  `finish_reason=stop | stream=yes ttfb=1.7s | content=32089 chars,
-  reasoning=104925 chars` after a 690s generation, and validated OK. ttfb of
-  1.7s against the previous ~273s idle wall is the whole story: the socket
-  received bytes almost immediately this time and never went idle.
+      CONFIRMED on the 2026-10-17 06:52 run: `finish_reason=stop | stream=yes
+      ttfb=1.7s | content=32089 chars, reasoning=104925 chars` after a 690s
+      generation. ttfb of 1.7s against the previous ~273s idle wall is the
+      whole story — the socket received bytes almost immediately and never
+      went idle. Non-streamed requests from a reasoning model on a ~25k-token
+      dump died at ~273s with `http.client.RemoteDisconnected`, which is
+      raised when the PEER closes the connection before any response byte.
+      Raising request_timeout never helped, because you were never waiting on
+      the client-side timeout.
 
   L7. ESCALATION IS CONDITIONAL ON TRUNCATION. Attempt 2 doubles the budget
   only when attempt 1 returned `finish_reason=length`. After a transport
@@ -108,67 +92,87 @@
       from either attempt. Now logged: model, max_tokens, payload chars,
       approx tokens, elapsed seconds, exception class and message.
 
+  L10. ORDER IS DERIVED FROM MODEL IDENTITY, NOT FROM SLOT NAME. Chain position
+       comes from `MODEL_PRIORITY`, matched by substring against the model id.
+       Reassigning a secret can change which model is reachable, but it cannot
+       change what order the reachable models are tried in. An unknown model
+       sorts last rather than being dropped. Ties keep registration order.
+
+       CONFIRMED on the 2026-10-17 08:32 run: with Step 5 Preview in the
+       ULTRA_POWERFUL slot and GLM in VPOWERFUL (i.e. pre-swap), the log read
+       `Chain order: 1.glm -> 2.step-5-preview`. That is correct — identity
+       said GLM was priority 2 and nothing matched priority 1, because that
+       run's secrets had not yet been swapped. Once Step 5 Preview is in the
+       VPOWERFUL slot as intended, the same table yields
+       `1.stepfun-ai/step-5-preview -> 2.z-ai/glm-5.3-flash`, which is the
+       required order. No code change was needed for the swap; that is the
+       point of L10.
+
   FEEDS. WaPo dropped — five feeds returned four 502s and one 404 on three
   consecutive runs; that is a dead endpoint, not flakiness, and the 429-only
   retry path gave a 502 exactly one attempt. NYT: Job Market, NYT:
   Corrections and Bloomberg: Green dropped — 404 on every run. WSJ is kept
-  but the run log has now answered the question: see the WSJ block below.
+  but the run log has answered the question: see the WSJ block below.
 
   ==============================================================================
-  v6 — WHAT CHANGED AND WHY  (2026-10-17, after successful_run.txt)
+  v9 — GLM-5.3-FLASH THINKING CONTROL  (2026-10-17, after lastrun.txt)
   ==============================================================================
-  L9. GLM-5.3-FLASH JOINS THE CHAIN AS THE INTERMEDIATE MODEL, and
-      `NIM_ULTRA_POWERFUL_MODEL` — a secret that existed in the workflow env
-      from the start but was never read by the script — is now used. The
-      chain is: VPOWERFUL (Step 5 Preview, primary) -> ULTRA_POWERFUL
-      (z-ai/glm-5.3-flash) -> POWERFUL -> ULTRA -> LIGHTNING.
+  THE FAILURE, EXACTLY AS LOGGED:
 
-      Placement rationale: GLM-5.3-Flash is a strong model with materially
-      worse latency than Step 5. It is a good SECOND call and a poor FIRST
-      call — if it were primary, every brief would wait on its latency even on
-      the days Step 5 would have answered first. Behind the primary it costs
-      nothing when Step 5 succeeds and only determines the run when it
-      doesn't. The 34,194-char index.html proves Step 5 still lands first in
-      practice, so GLM does not slow the daily job down.
+      [LLM] Calling PRIMARY (attempt 1/2, max_tokens=32000)
+      [LLM] ***: finish_reason=length | cap=32000 | stream=yes ttfb=62.4s
+              | content=0 chars, reasoning=131710 chars
+      [LLM] 'content' empty but 131710 chars reasoning returned.
+      [LLM] Hit max_tokens (32000) — consider raising it.
+      [LLM] Recovered validated brief from reasoning channel of ***
 
-  ==============================================================================
-  v7 — WHAT CHANGED AND WHY  (2026-10-17, GLM budget at parity with Step 5)
-  ==============================================================================
-  v6 sized GLM-5.3-Flash at 24000 max_output_tokens on the theory that a
-  non-reasoning model needs no chain-of-thought headroom — the Nemotron
-  fallback had produced a validated brief in 1,781 tokens, so 24k looked like
-  ample room. That reasoning was sound on paper and wrong in posture: it bets
-  the intermediate model's success on the assumption that it stays small. The
-  failure modes are asymmetric. Over-budgeting costs nothing, because
-  `max_tokens` is a ceiling, not a target — an unused allowance is simply
-  unspent. Under-budgeting costs the run: `finish_reason=length`, a rejected
-  brief, and a fall through to Nemotron, which is exactly what position 2 was
-  added to avoid.
+  GLM-5.3-Flash spent its entire 32000-token ceiling deliberating and emitted
+  no answer. 131,710 chars of reasoning is roughly 33,000 tokens — it was
+  still thinking when the cap cut it off. L3 then recovered a "brief" out of
+  the truncated reasoning, which is why the output read as raw, unpolished
+  deliberation rather than a finished brief. The recovery path did its job;
+  the input to it was garbage.
 
-  So GLM now matches Step 5 at 32000, with the doubled 1800s timeout retained
-  on top. Worth naming what did NOT change and why: the retry escalation still
-  treats the two identically (L7 — doubling to 64000 on `finish_reason=length`
-  only), because the mechanism is about the transport, not the model. If GLM's
-  ceiling still proves tight, the next move is `finish_reason=length` in the
-  log saying so, which is exactly what L4 was built to surface.
+  I WAS WRONG ABOUT GLM, THREE TIMES, AND THE FILE SAID SO. v6/v7 classified
+  GLM as "non-reasoning, so it has no chain-of-thought to fund". That was a
+  guess, and it was false. Z.AI's docs: thinking is ON by default across the
+  GLM-5.x line, and GLM-5.3 / 5.3-FLASH use FORCED thinking. ttfb of 62.4s —
+  over a minute before the first byte — is the empirical confirmation, and
+  `reasoning=131710 chars` settles it. The two consequences were both wrong:
+  a 24000-token budget (raised to 32000 in v7) assumed no CoT headroom was
+  needed, and `temperature: 0.1` was a house default where GLM's card
+  specifies 1.0.
 
-  DIAGNOSED, NOT FIXED: WSJ. The three WSJ feeds have kept 0 items on every
-  run, and the diagnostic added in v5 has now answered why — parsed dates are
-  rooted in January 2025 (World News 2025-01-24..2025-01-27, Markets
-  2025-01-25..2025-01-27, US Business 2025-01-24). Every other stale feed in
-  the same run parsed correctly to within days of the window. The pubDates
-  are genuinely old, which means the fix is a wider lookback window for WSJ
-  specifically — NOT a parser change. That is deliberately left for a
-  follow-up rather than guessed at here, because a wider window interacts
-  with dedupe and with the prompt budget and deserves its own change.
+  L11. THINKING EFFORT IS CONTROLLED PER MODEL. GLM-5.3-Flash cannot have
+       thinking disabled — `enable_thinking` is a documented no-op on its
+       template, and v6/v7's assumption that it could be switched off was
+       part of the same error. It CAN have effort throttled, via
+       `reasoning_effort` nested inside `chat_template_kwargs`:
+       max / high / low. Placement confirmed by the operator's own working
+       litellm config (`extra_body: chat_template_kwargs: reasoning_effort:
+       "high"`); the top-level form I described in prose was wrong, and the
+       nested form is what is implemented here.
 
-  Also observed in the same run and left alone deliberately: FT: China and
-  FT: Americas returned 0 in window with a parsed range ending 2026-10-17
-  04:00, i.e. they are fresh but simply carry nothing inside the window
-  today. That is normal feed variation, not a defect. Several NYT culture
-  feeds (Movies/Music/Television/Theater/Travel/Automobiles) also returned 0
-  with ranges that end on or near 2026-10-16 — again fresh items that missed
-  the window by hours, not broken parsing.
+       GLM now requests `low`, with `high` as the next step up if quality
+       drops. The operator's config uses `high` — a reasonable landing point,
+       but `low` is the better first probe because it fails loudly if too
+       weak, whereas `high` risks reproducing the 62.4s / 131k-char behaviour
+       more slowly and less legibly.
+
+       `clear_thinking: false` appears in the operator's litellm config but
+       nowhere in NVIDIA's published docs, so it is deliberately NOT sent.
+
+  L12. GLM'S BUDGET AND SAMPLING FOLLOW ITS OWN CARD, NOT OURS.
+       max_output_tokens 32000 -> 65536 (matching the operator's litellm
+       config, which runs 65536 against this endpoint successfully).
+       temperature 0.1 -> 1.0, top_p 0.95 unchanged.
+       The ceiling is generous on purpose: `max_output_tokens` is a ceiling,
+       not a target, so an unspent allowance costs nothing while a tight one
+       converts a working model into a `finish_reason=length` failure.
+
+  v8's corrections (the three transcription defects) are carried forward
+  fixed. `MODEL_PRIORITY`, `SYSTEM_PROMPT`, the feed list, streaming, and the
+  retry logic are unchanged.
 ================================================================================
 """
 import os
@@ -220,25 +224,98 @@ NEMOTRON_LIGHTNING_MODEL = os.getenv("NEMOTRON_LIGHTNING_MODEL")
 NIM_POWERFUL_MODEL = os.getenv("NIM_POWERFUL_MODEL")
 NIM_ULTRA_POWERFUL_MODEL = os.getenv("NIM_ULTRA_POWERFUL_MODEL")
 NIM_VPOWERFUL_MODEL = os.getenv("NIM_VPOWERFUL_MODEL")
-# v6 (L9): the chain is ordered by preference, not by model strength. Step 5
-# Preview leads because latency, not quality, is what the daily job actually
-# cares about — it answered in 690s when it worked, and the fallback models
-# answer faster. GLM-5.3-Flash sits at position 2 because it is the best model
-# that is reachable when Step 5 is not: good enough that you want it over
-# Nemotron, slow enough that you do not want it first.
+
+# ==============================================================================
+# MODEL SOURCES  (L10: storage only — carries no preference)
+# ==============================================================================
+# Every model that is on file, in registration order. Each entry carries its
+# base_url and api_key because those are per-endpoint properties. The SLOT each
+# entry arrived in carries no meaning: reassigning which secret holds which
+# model changes what is REACHABLE, never what ORDER the models are tried in.
 #
-# Note `NIM_ULTRA_POWERFUL_MODEL` was already present in the workflow env from
-# the beginning but was never read by this script. It now is.
-MODEL_CHAIN = [
-    m for m in [
-        {"model": NIM_VPOWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
-        {"model": NIM_ULTRA_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
-        {"model": NIM_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
-        {"model": NEMOTRON_ULTRA_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
-        {"model": NEMOTRON_LIGHTNING_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
-    ]
-    if m["model"] and m["api_key"]
+# v8 replaced the old hardcoded `MODEL_CHAIN` list — which was in slot order and
+# thereby silently made GLM primary when the two slots were swapped — with this
+# list plus `MODEL_PRIORITY` below.
+_MODEL_SOURCES = [
+    {"model": NIM_VPOWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
+    {"model": NIM_ULTRA_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
+    {"model": NIM_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
+    {"model": NEMOTRON_ULTRA_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
+    {"model": NEMOTRON_LIGHTNING_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
 ]
+
+# ==============================================================================
+# MODEL PRIORITY  (L10: the only place chain order lives)
+# ==============================================================================
+# Matched by substring against the model id, case-insensitively, FIRST MATCH
+# WINS in the order written — so a more specific key must precede a more
+# general one. Lower number = tried earlier.
+#
+# Required order, stated by the operator and encoded here: STEP 5 PREVIEW
+# FIRST, THEN GLM-5.3-FLASH. Placement rationale. Step 5 Preview leads because
+# latency, not quality, is what the daily job cares about — it answered
+# correctly in 690s and produced a 34,194-character brief. GLM-5.3-Flash sits
+# at position 2 because it is the best model reachable when Step 5 is not: good
+# enough that you want it over Nemotron, slow enough that you do not want it
+# first. Behind the primary it costs nothing on the days Step 5 answers.
+#
+# Nemotron is the family default at 3: ultra, lightning and super share the
+# substring, so they keep their mutual order from `_MODEL_SOURCES` (the tie
+# broken by registration order, for determinism).
+MODEL_PRIORITY = [
+    {"match": "step-5-preview", "priority": 1},    # primary — outer reasoning model
+    {"match": "glm", "priority": 2},               # intermediate — forced thinking
+    {"match": "nemotron", "priority": 3},          # family — ultra / lightning / super
+]
+
+# A model matched here is skipped entirely rather than tried last. Exists so a
+# retired or known-broken model can be removed from rotation without editing
+# `_MODEL_SOURCES`, `FEEDS`, or any secret.
+MODEL_BLOCKLIST: list[str] = []
+
+# An unprioritised model sorts here — last, but still present. Adding a model to
+# the chain without touching this table therefore costs you its position, not
+# its participation.
+_UNPRIORITISED_PRIORITY = 10_000
+
+
+def _priority_for(model: str) -> int:
+    """Resolve the chain position for `model`. Unmatched -> last, not dropped."""
+    low = (model or "").lower()
+    for entry in MODEL_PRIORITY:
+        if entry["match"].lower() in low:
+            return entry["priority"]
+    return _UNPRIORITISED_PRIORITY
+
+
+def _build_model_chain() -> list[dict]:
+    """Resolve the model chain from identity, deduplicating and dropping empties.
+
+    Order comes from `MODEL_PRIORITY` (L10), never from which secret a model
+    arrived in. Ties preserve registration order for determinism.
+    """
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for entry in _MODEL_SOURCES:
+        base_url = entry.get("base_url")
+        api_key = entry.get("api_key")
+        model = entry.get("model")
+        if not (model and base_url and api_key) or model in seen:
+            continue
+        low = model.lower()
+        if any(b.lower() in low for b in MODEL_BLOCKLIST):
+            continue
+        seen.add(model)
+        unique.append({"model": model, "base_url": base_url, "api_key": api_key})
+
+    ordered = sorted(
+        enumerate(unique),
+        key=lambda pair: (_priority_for(pair[1]["model"]), pair[0]),
+    )
+    return [entry for _, entry in ordered]
+
+
+MODEL_CHAIN = _build_model_chain()
 if not MODEL_CHAIN:
     logging.error("No valid models configured. .env loaded? Vars present?")
     sys.exit(1)
@@ -258,32 +335,42 @@ RETRY_TOKEN_MULTIPLIER = 2
 # PER-MODEL LLM TUNING  (L1)
 # ==============================================================================
 # Matched by substring against the model id, case-insensitively, in the order
-# written — so a more specific key must come before a more general one. First
+# written — so a more specific key must go before a more general one. First
 # match wins; anything unmatched falls through to _DEFAULT_MODEL_TUNING.
 #
 # `max_output_tokens` — the completion cap. Reasoning tokens count against it,
 #   so a reasoning model on a ~25k-token news dump needs far more headroom than
 #   a chat model needs.
 # `temperature` / `top_p` — per the model's published recommendation. Step 5
-#   Preview's card specifies 1.0 / 0.95; the Nemotron family has no sampling
-#   dial, so its entries set temperature to the previous global default and it
-#   is simply not sent (see `"send_temperature"`).
+#   Preview's card specifies 1.0 / 0.95; GLM-5.3-Flash's card likewise
+#   specifies 1.0 / 0.95; the Nemotron family has no sampling dial, so its
+#   entries carry the former global default and it is simply not sent.
 # `request_timeout` — socket ceiling only. It does NOT bound how long a
 #   non-streamed request can wait: the gateway closes idle connections well
 #   before this, which is why v5 streams (L6). Kept generous so a slow but
 #   streamed response is never cut off client-side.
 # `send_temperature` — False omits the key entirely rather than sending a
 #   value the endpoint would reject with HTTP 400.
+# `reasoning_effort` — for models with FORCED thinking, the only available
+#   throttle (L11). One of max / high / low. Sent nested inside
+#   `chat_template_kwargs`, per the operator's working litellm config. Models
+#   without a thinking dial omit the key entirely — for Nemotron the switch is
+#   `enable_thinking` (see `NO_THINK_MODEL_KEYWORDS`), and sending it a
+#   reasoning_effort it does not implement is an HTTP 400.
 #
-# v7: `max_output_tokens` is a CEILING, NOT A TARGET. Every model that has not
-# yet been observed in production gets the most generous budget we are willing
-# to afford rather than the smallest budget we think it needs. An unused
-# allowance is simply unspent; a tight ceiling converts a model that was going
-# to succeed into a `finish_reason=length` failure and a fall through to the
-# next model. That asymmetry is why GLM-5.3-Flash now matches Step 5 at 32000.
+# v7/v12: `max_output_tokens` is a CEILING, NOT A TARGET. Every model that has
+# not yet been observed in production gets the most generous budget we are
+# willing to afford rather than the smallest budget we think it needs. An
+# unused allowance is simply unspent; a tight ceiling converts a model that was
+# going to succeed into a `finish_reason=length` failure and a fall through to
+# the next model.
+#
+# v8: this table is matched against the MODEL ID, not against which secret the
+# model arrived in — the same protection `MODEL_PRIORITY` gives ordering. So
+# swapping secrets can no longer mis-tune a model either.
 MODEL_TUNING = [
     {
-        "match": "step-5-preview",          # VPOWERFUL — Step 5 Preview
+        "match": "step-5-preview",
         "max_output_tokens": 32000,
         "temperature": 1.0,
         "top_p": 0.95,
@@ -292,28 +379,34 @@ MODEL_TUNING = [
         "note": "Model card: temperature=1.0, top_p=0.95, up to 1M output.",
     },
     {
-        # v6 (L9) added GLM; v7 raised its budget from 24000 to 32000, matching
-        # Step 5 Preview exactly. See the v7 docstring block for why: a ceiling
-        # is not a target, and over-provisioning a model that has never been
-        # observed costs nothing while under-provisioning it costs the run.
+        # v9 (L11, L12): GLM-5.3-Flash is a FORCED-THINKING model. v6 and v7
+        # classified it as non-reasoning and were wrong; the 08:32 run proved
+        # it — ttfb 62.4s and 131,710 chars of reasoning against a 32000 cap,
+        # finishing `length` with content=0. See the v9 docstring block.
         #
-        # Non-reasoning, so it has no chain-of-thought to fund — but that is an
-        # argument about what it will USE, not about what it should be ALLOWED.
+        # `reasoning_effort: "low"` is the fix for that: it throttles the
+        # deliberation instead of feeding it. `high` is the next step up if
+        # output quality drops, and `max` is what the last run effectively
+        # used by default. thinking cannot be disabled outright — v6/v7
+        # assumed it could and that was part of the same error.
         #
-        # The doubled timeout (1800s vs Step 5's 900s) is retained from v6 and
-        # is the one knob that matters for a latency-heavy model: with
-        # streaming on, a long generation costs wall-clock, not correctness,
-        # so the only thing a timeout can do here is cut a good answer off.
-        # `temperature: 0.1` is still the house default rather than a GLM
-        # model-card value — the first knob to revisit if GLM's output reads
-        # flat. See the temperature note in the header block above.
+        # max_output_tokens 32000 -> 65536, matching the operator's litellm
+        # config, which runs this endpoint at 65536 successfully.
+        # temperature 0.1 -> 1.0, per GLM's card. 0.1 was our house default
+        # imposed on a model that specifies otherwise.
+        #
+        # The 1800s timeout is retained: the last call ran 17m43s comfortably
+        # inside it, and with streaming a long generation costs wall-clock,
+        # not correctness. `clear_thinking: false` appears in the operator's
+        # litellm config but in no NVIDIA doc, so it is deliberately not sent.
         "match": "glm",
-        "max_output_tokens": 32000,
-        "temperature": 0.1,
+        "max_output_tokens": 65536,
+        "temperature": 1.0,
         "top_p": 0.95,
         "request_timeout": 1800,
         "send_temperature": True,
-        "note": "GLM-5.3-Flash: 32000 like Step 5; 1800s ceiling for its latency.",
+        "reasoning_effort": "low",
+        "note": "GLM-5.3-Flash: forced thinking, effort=low; 65536 tok; 1800s.",
     },
     {
         "match": "nemotron",                # ULTRA / LIGHTNING / POWERFUL(Super)
@@ -409,11 +502,13 @@ NO_THINK_KWARG = True
 # The gate is now an explicit per-model set, so non-Nemotron models are handled
 # by the same switch rather than falling through it.
 #
-# v6 (L9): GLM-5.3-Flash is NOT added here. It is a non-reasoning chat model,
-# so it has no thinking mode to disable, and sending `chat_template_kwargs`
-# to an endpoint that does not implement it is exactly the HTTP 400 that the
-# retry path exists to survive. Step 5 Preview is likewise absent and streams
-# fine on its default behaviour (confirmed by the 06:52 run).
+# v6 said "GLM-5.3-Flash is NOT added here. It is a non-reasoning chat model" —
+# false, and v9 corrects it. GLM has forced thinking that cannot be switched
+# off, so `enable_thinking` is the wrong knob for it and would be a no-op at
+# best. Its effort is throttled via `reasoning_effort` in `MODEL_TUNING` (L11)
+# instead. GLM is deliberately NOT listed below, and that omission is now a
+# considered decision rather than a misclassification: the entry that would
+# send `chat_template_kwargs: {"enable_thinking": False}` is unavailable to it.
 NO_THINK_MODEL_KEYWORDS = ["nemotron"]
 # ==============================================================================
 # OUTPUT VALIDATION GATE
@@ -980,7 +1075,7 @@ def harvest_feeds() -> list[Article]:
 
     return sorted(all_articles.values(), key=lambda a: a.pub_date, reverse=True)
 # ==============================================================================
-# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF   (v4 policy, retained in v5/v6/v7)
+# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF   (v4 policy, retained in v5–v9)
 # ==============================================================================
 # v4 change: human-interest and lifestyle items were promoted to first-class
 # content and romantic/sexual relationship coverage excluded.
@@ -993,9 +1088,9 @@ def harvest_feeds() -> list[Article]:
 # instruction rather than by data.
 #
 # v5 edits to this prompt are limited to the two source lists, because WaPo is
-# no longer fetched (see the v5 feed removals above). v6 and v7 change nothing
-# here — the balance policy and the romance exclusion are model-agnostic and
-# were deliberately left untouched by a model-chain change.
+# no longer fetched (see the v5 feed removals above). v6 through v9 change
+# nothing here — the balance policy and the romance exclusion are
+# model-agnostic and were deliberately left untouched by model-chain changes.
 SYSTEM_PROMPT = """
 ROLE: Senior Intelligence Analyst writing a morning brief that is read by two people over breakfast — one a markets professional who wants macro and financial density, one a general reader who wants people, culture and life.
 STYLE: Ultra-concise, dense, highly scannable. Zero conversational filler, zero setup sentences, zero meta-commentary. Every bullet must earn its place.
@@ -1124,18 +1219,19 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str,
     Returns (content, finish_reason, reasoning, meta).
 
     v5 (L6): streams by default. `stream: False` is what produced the Step 5
-    failures in script_ran_but_no_step5.txt — a reasoning model on a ~25k-token
-    dump spends minutes computing before its first output token, and with no
-    bytes in flight the gateway's idle limit closed the socket at ~273s with
-    `http.client.RemoteDisconnected`, far inside the 900s socket timeout.
-    Streaming keeps bytes moving from the first token, so the idle limit is
-    never reached, and logs time-to-first-byte.
+    failures — a reasoning model on a ~25k-token dump spends minutes computing
+    before its first output token, and with no bytes in flight the gateway's
+    idle limit closed the socket at ~273s with `http.client.RemoteDisconnected`,
+    far inside the 900s socket timeout. Streaming keeps bytes moving from the
+    first token, so the idle limit is never reached, and logs
+    time-to-first-byte. Confirmed by the 06:52 run (ttfb=1.7s over a 690s
+    generation).
 
     Two fallbacks, both automatic:
       * HTTP 400/422 on the streamed request -> retry non-streamed.
       * a transport-level failure on the streamed request -> the caller retries
-        with use_stream=False, so a streaming-hostile endpoint degrades to the
-        old behaviour instead of losing the model.
+        with streaming disabled, so a streaming-hostile endpoint degrades to
+        the old behaviour instead of losing the model.
     """
     base_url = model_cfg["base_url"].rstrip("/")
     api_key  = model_cfg["api_key"]
@@ -1159,9 +1255,28 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str,
         # sent it and relied on the 400-retry path, which wasted a round trip.
         if tuning.get("send_temperature", True):
             payload["temperature"] = temperature
+        # Thinking control, and it is TWO different switches (v9, L11):
+        #   * `enable_thinking` disables thinking where the model supports
+        #     disabling. Nemotron is on that list.
+        #   * `reasoning_effort` throttles thinking where thinking is FORCED
+        #     and cannot be turned off. GLM-5.3-Flash is the case in point:
+        #     v6/v7 thought `enable_thinking` would switch it off, and it is a
+        #     documented no-op on that template.
+        # Both live nested inside `chat_template_kwargs`, which is the placement
+        # the operator's working litellm config uses. The top-level form I
+        # described in prose was wrong.
+        #
+        # GLM is deliberately absent from `NO_THINK_MODEL_KEYWORDS` (see the
+        # note there): it is not that GLM has no thinking mode to disable, it is
+        # that disabling is not available to it. Effort is the only knob.
+        template_kwargs: dict = {}
         if NO_THINK_KWARG and any(kw in model.lower() for kw in NO_THINK_MODEL_KEYWORDS) \
                 and "nvidia" in base_url:
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            template_kwargs["enable_thinking"] = False
+        if tuning.get("reasoning_effort") and "nvidia" in base_url:
+            template_kwargs["reasoning_effort"] = tuning["reasoning_effort"]
+        if template_kwargs:
+            payload["chat_template_kwargs"] = template_kwargs
         return payload
 
     def post(payload: dict):
@@ -1239,6 +1354,10 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str,
         content, finish, reasoning, ttfb = send_stream(payload)
         streamed = True
     except HTTPError as e:
+        # A 400 here may mean the endpoint rejected `chat_template_kwargs`
+        # outright rather than a specific key inside it. Both the whole-dict
+        # removal below and the per-key removal in `_retry_without_chat_kwargs`
+        # are tried, because a rejection of one key should not cost the model.
         if NO_THINK_KWARG and e.code in (400, 422) and "chat_template_kwargs" in payload:
             logger.info(f"[LLM] {model}: endpoint rejected chat_template_kwargs; "
                         f"retrying streamed without.")
@@ -1277,6 +1396,7 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str,
             "finish_reason": finish,
             "content_chars": len(content),
             "reasoning_chars": len(reasoning),
+            "chat_template_kwargs": build_payload(True).get("chat_template_kwargs"),
             "content": content,
         }, indent=2, ensure_ascii=False))
 
@@ -1313,11 +1433,17 @@ def generate_brief(user_prompt: str) -> tuple[str | None, str]:
         logger.info(f"[LLM] Tuning for {m['model']}: max_tokens={t['max_output_tokens']}, "
                     f"temperature={'omitted' if not t.get('send_temperature', True) else t['temperature']}, "
                     f"timeout={t['request_timeout']}s ({t['note']})")
-    # L9 (v6): print the chain order explicitly. With five entries the log line
-    # "PRIMARY" / "FALLBACK" no longer tells you which position a model holds,
-    # and knowing the position is how you tell a designed-for failure from an
-    # accidental one.
-    chain_desc = " -> ".join(f"{i+1}.{_tuning_for(m['model'])['match']}"
+    # L10 (v8): print the resolved order. This is the single most important
+    # line in the log now that order is derived from model identity rather
+    # than from secret names: it is the only place the run tells you which
+    # model is the primary call. If a secret is reassigned and this line does
+    # not change, the swap was inert — which is the point.
+    #
+    # v8 CORRECTION: this prints the FULL MODEL ID via `_priority_label`, not
+    # the match keyword. The keyword would read "1.step-5-preview" and hide
+    # which model actually ran — exactly the information the line exists to
+    # expose.
+    chain_desc = " -> ".join(f"{i+1}.{_priority_label(m['model'])}"
                              for i, m in enumerate(valid_chain))
     logger.info(f"[LLM] Chain order: {chain_desc}")
     for idx, model_cfg in enumerate(valid_chain):
@@ -1368,7 +1494,8 @@ def generate_brief(user_prompt: str) -> tuple[str | None, str]:
                 if not text and reasoning and finish == "length":
                     detail = (f"model spent its whole {max_tokens}-token budget on "
                               f"reasoning ({len(reasoning)} chars) and emitted no answer — "
-                              f"raise max_tokens for {model_name}")
+                              f"raise max_tokens for {model_name}, and consider "
+                              f"lowering reasoning_effort for {model_name}")
                 elif not text:
                     detail = f"no content returned (finish_reason={finish})"
                 else:
@@ -1416,6 +1543,22 @@ def generate_brief(user_prompt: str) -> tuple[str | None, str]:
         if idx < len(valid_chain) - 1:
             logger.info("[LLM] Falling back to next model...")
     return None, ""
+def _priority_label(model: str) -> str:
+    """Human label for the chain-order log line.
+
+    Returns the full model id — the thing that actually ran. The match keyword
+    would be shorter but would hide which model the line refers to, which is
+    the one piece of information the line exists to surface. An empty priority
+    is annotated so a genuinely unprioritised model is distinguishable from a
+    matched one.
+
+    v8 note: the first draft of this file called `_priority_label` without
+    defining it, which raised NameError at exactly this log line. Any new
+    helper referenced by `generate_brief` should be checked the same way.
+    """
+    p = _priority_for(model)
+    suffix = "" if p < _UNPRIORITISED_PRIORITY else " (unprioritised → last)"
+    return f"{model}{suffix}"
 def strip_code_fences(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
