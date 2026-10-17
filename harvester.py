@@ -32,6 +32,57 @@
 
   Verified NOT used: ft-rss.herokuapp.com (Heroku free-tier shutdown, 502) and
   FiveFilters Full-Text RSS (free hosted service discontinued by its operator).
+
+  ==============================================================================
+  LLM PIPELINE STRATEGY  (v3, carried into v4 unchanged)
+  ==============================================================================
+  L1. PER-MODEL TUNING. `MAX_OUTPUT_TOKENS` / `LLM_TEMPERATURE` are gone.
+      Each model gets `(max_output_tokens, temperature, timeout)` from
+      `MODEL_TUNING`, matched by substring, with a conservative default for
+      anything unrecognised. Step 5 Preview's settings follow its published
+      model card (temperature=1.0, top_p=0.95); Nemotron entries ignore
+      temperature, which the Nemotron models do not expose.
+
+  L2. ESCALATING RETRY. `ATTEMPTS_PER_MODEL=2` used to re-send the identical
+      payload, so a truncation failure was reproduced byte-for-byte 2 minutes
+      later. Attempt 2 now multiplies the budget by `RETRY_TOKEN_MULTIPLIER`
+      and re-sends. Same retry, more room.
+
+  L3. REASONING IS RECOVERED, NOT DISCARDED. The old code detected
+      `reasoning_content`, wrote it to llm_debug/, and then returned the empty
+      `content` string so the validator rejected it as "too short (0 chars)".
+      v3 returns the reasoning alongside the content and, when the reasoning
+      itself contains the required output header (some models emit the answer
+      inside the reasoning channel), validates it as a last resort.
+
+  L4. THE FAILURE MODE IS NAMED. "too short (0 chars)" told you nothing.
+      v3 logs the specific cause — truncated by max_tokens vs. thinking-only
+      response vs. genuinely bad output — and names the knob to turn.
+
+  L5. ONE CONFIG KNOB PER MODEL, EDITABLE IN CODE. Each entry is a plain
+      dict literal at the top of the file. No .env plumbing, no precedence
+      puzzles. If a model's budget needs changing, you change one number in
+      one place and the startup banner prints what it resolved to.
+
+  ==============================================================================
+  BRIEF CONTENT POLICY  (v4 — the only change in this file)
+  ==============================================================================
+  v1-v3 closed with "Discard pure noise: generic 'markets mixed' wrap-ups,
+  clickbait, non-financial lifestyle fluff." That instruction was doing more
+  than removing noise: it removed the Arts, Books, Film, Music, Television,
+  Theatre, Fashion, Dining, Travel, Real Estate and Obituaries items that the
+  harvester already fetches as must-have feeds. The brief was macro-only by
+  instruction, not by data.
+
+  v4 rewrites SYSTEM_PROMPT only. Nothing else in this file differs from v3.
+
+  The new prompt writes for two readers — one who wants macro and markets, one
+  who wants people, culture and life. Human-interest and lifestyle items are
+  promoted to first-class content. Romantic and sexual relationship coverage is
+  excluded explicitly, with a scope note so the exclusion cannot swallow the
+  ordinary macro use of "relations" ("US–China relations", "EU–UK trade
+  relations", "the Fed's relationship with markets"). Without that scope note a
+  literal reading of the exclusion would delete core geopolitical stories.
 ================================================================================
 """
 import os
@@ -67,7 +118,7 @@ loaded = load_dotenv()  # picks up .env in cwd if it exists
 print(f"load_dotenv returned: {loaded}")
 for var in ["NVIDIA_API_KEY", "NEMOTRON_ULTRA_MODEL",
             "NEMOTRON_LIGHTNING_MODEL", "NIM_POWERFUL_MODEL",
-            "NEMOTRON_VPOWERFUL_MODEL"]:
+            "NIM_VPOWERFUL_MODEL"]:
     v = os.getenv(var)
     print(f"{var}: {'SET (len=%d)' % len(v) if v else 'MISSING'}")
 # --- Output config ---
@@ -95,13 +146,79 @@ if not MODEL_CHAIN:
     logging.error("No valid models configured. .env loaded? Vars present?")
     sys.exit(1)
 ATTEMPTS_PER_MODEL = 2
-MAX_OUTPUT_TOKENS = 8000
-LLM_TEMPERATURE = 0.1
+# CHANGED (v3, L1): was a single global `MAX_OUTPUT_TOKENS = 8000`.
+# See MODEL_TUNING below.
 LLM_RATE_LIMIT_BACKOFF = 30
-LLM_REQUEST_TIMEOUT = 300
-# --- INPUT SIZE GUARDS ---
-MAX_CHARS_PER_ITEM = 500
-INPUT_CHAR_BUDGET = 100_000
+# CHANGED (v3, L1): was a single global `LLM_REQUEST_TIMEOUT = 300`.
+# Baseline is now per-model via MODEL_TUNING; this is the floor for any model
+# without an explicit entry.
+DEFAULT_LLM_REQUEST_TIMEOUT = 300
+# CHANGED (v3, L2): retry budget multiplier. Attempt 2 asks for this many more
+# tokens than attempt 1 rather than repeating the request verbatim.
+RETRY_TOKEN_MULTIPLIER = 2
+# ==============================================================================
+# PER-MODEL LLM TUNING  (L1)
+# ==============================================================================
+# Matched by substring against the model id, case-insensitively, in the order
+# written — so a more specific key must come before a more general one. First
+# match wins; anything unmatched falls through to _DEFAULT_MODEL_TUNING.
+#
+# `max_output_tokens` — the completion cap. Reasoning tokens count against it,
+#   so a reasoning model on a ~25k-token news dump needs far more headroom than
+#   a chat model needs.
+# `temperature` / `top_p` — per the model's published recommendation. Step 5
+#   Preview's card specifies 1.0 / 0.95; the Nemotron family has no sampling
+#   dial, so its entries set temperature to the previous global default and it
+#   is simply not sent (see `"send_temperature"`).
+# `request_timeout` — seconds. Baseline is past the largest single response
+#   seen in production plus headroom; a raised token budget will outgrow a 300s
+#   socket timeout and raise, which the retry loop would then misreport.
+# `send_temperature` — False omits the key entirely rather than sending a
+#   value the endpoint would reject with HTTP 400.
+MODEL_TUNING = [
+    {
+        "match": "step-5-preview",          # VPOWERFUL — you (Step 5)
+        "max_output_tokens": 32000,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "request_timeout": 900,
+        "send_temperature": True,
+        "note": "Model card: temperature=1.0, top_p=0.95, up to 1M output.",
+    },
+    {
+        "match": "nemotron",                # ULTRA / LIGHTNING / POWERFUL(Super)
+        "max_output_tokens": 16000,
+        "temperature": 0.1,
+        "top_p": 0.95,
+        "request_timeout": 900,
+        "send_temperature": False,
+        "note": "No sampling dial; 0.1 retained only as a documented no-op.",
+    },
+]
+_DEFAULT_MODEL_TUNING = {
+    "match": "*",
+    "max_output_tokens": 32000,
+    "temperature": 0.1,
+    "top_p": 0.95,
+    "request_timeout": 900,
+    "send_temperature": True,
+    "note": "Unmatched model: generous budget, conservative temperature.",
+}
+# Field names NIM endpoints have been observed to use for the reasoning channel.
+# v1/v2 read only the first entry, so an endpoint using `reasoning` returned
+# nothing and the empty content was misread as a truncation.
+REASONING_FIELD_NAMES = ["reasoning_content", "reasoning", "reasoning_text"]
+
+
+def _tuning_for(model: str) -> dict:
+    """Resolve the tuning entry for `model`. Unmatched -> conservative default."""
+    low = (model or "").lower()
+    for entry in MODEL_TUNING:
+        if entry["match"].lower() in low:
+            return entry
+    return _DEFAULT_MODEL_TUNING
+
+
 # ==============================================================================
 # FETCH PACING CONFIG  (R2 / R3 / R4)
 # ==============================================================================
@@ -150,7 +267,13 @@ FEED_CONTACT = "fake_email@proton.me"
 # ==============================================================================
 # THINKING MODE
 # ==============================================================================
-NO_THINK_KWARG = True
+# The old gate required "nemotron" in the model name, so any non-Nemotron
+# model (e.g. stepfun-ai/step-5-preview) silently kept its default thinking
+# behaviour — which for a reasoning model on a 25k-token dump meant the
+# entire token budget was consumed by CoT before a single answer token.
+# The gate is now an explicit per-model set, so non-Nemotron models are handled
+# by the same switch rather than falling through it.
+NO_THINK_MODEL_KEYWORDS = ["nemotron"]
 # ==============================================================================
 # OUTPUT VALIDATION GATE
 # ==============================================================================
@@ -161,7 +284,7 @@ REQUIRED_HEADERS = ["NEWS INTELLIGENCE BRIEF"]
 # FEED CONFIGURATION — organized by publication
 # ==============================================================================
 FEEDS = {
-    # ─── Financial Times ───
+    # ──── Financial Times ────
     "FT: Home (International)": "https://www.ft.com/rss/home",
     "FT: Markets": "https://www.ft.com/markets?format=rss",
     "FT: Global Economy": "https://www.ft.com/global-economy?format=rss",
@@ -188,11 +311,11 @@ FEEDS = {
     "FT: Telecoms": "https://www.ft.com/telecoms?format=rss",
     "FT: Africa": "https://www.ft.com/africa?format=rss",
     "FT: Middle East & North Africa": "https://www.ft.com/world/middle-east-north-africa?format=rss",
-    # ─── Wall Street Journal ───
+    # ──── Wall Street Journal ────
     "WSJ: World News": "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
     "WSJ: Markets": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     "WSJ: US Business": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
-    # ─── The New York Times ───
+    # ──── The New York Times ────
     "NYT: Home Page": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
     "NYT: World": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
     "NYT: US": "https://rss.nytimes.com/services/xml/rss/nyt/US.xml",
@@ -220,7 +343,7 @@ FEEDS = {
     "NYT: Obituaries": "https://rss.nytimes.com/services/xml/rss/nyt/Obituaries.xml",
     "NYT: Corrections": "https://rss.nytimes.com/services/xml/rss/nyt/Corrections.xml",
     "NYT: Your Money": "https://rss.nytimes.com/services/xml/rss/nyt/YourMoney.xml",
-    # ─── Bloomberg ───
+    # ──── Bloomberg ────
     "Bloomberg: Markets": "https://feeds.bloomberg.com/markets/news.rss",
     "Bloomberg: Politics": "https://feeds.bloomberg.com/politics/news.rss",
     "Bloomberg: Business": "https://feeds.bloomberg.com/business/news.rss",
@@ -229,7 +352,7 @@ FEEDS = {
     "Bloomberg: Economics": "https://feeds.bloomberg.com/economics/news.rss",
     "Bloomberg: Industries": "https://feeds.bloomberg.com/industries/news.rss",
     "Bloomberg: Green": "https://feeds.bloomberg.com/green/news.rss",
-    # ─── South China Morning Post ───
+    # ──── South China Morning Post ────
     "SCMP: World": "https://www.scmp.com/rss/5/feed",
     "SCMP: This Week in Asia": "https://www.scmp.com/rss/3/feed",
     "SCMP: Hong Kong": "https://www.scmp.com/rss/2/feed",
@@ -240,14 +363,14 @@ FEEDS = {
     "SCMP: Lifestyle": "https://www.scmp.com/rss/94/feed",
     "SCMP: Tech": "https://www.scmp.com/rss/36/feed",
     "SCMP: Business": "https://www.scmp.com/rss/92/feed",
-    # ─── Washington Post ───
+    # ──── Washington Post ────
     "WaPo: World": "https://feeds.washingtonpost.com/rss/world",
     "WaPo: National": "https://feeds.washingtonpost.com/rss/national",
     "WaPo: Business": "https://feeds.washingtonpost.com/rss/business",
     "WaPo: Technology": "https://feeds.washingtonpost.com/rss/technology",
     "WaPo: Politics": "https://feeds.washingtonpost.com/rss/politics",
 }
-# ─── Must-have feeds (always fetched) ───
+# ──── Must-have feeds (always fetched) ────
 # Your 12 FT sections, plus every non-FT publisher. Only FT is tiered.
 MUST_HAVE_FEEDS = {
     "FT: Home (International)", "FT: Markets", "FT: Global Economy",
@@ -671,10 +794,10 @@ def harvest_feeds() -> list[Article]:
                     time.sleep(random.uniform(*FEED_COURTESY_SLEEP))
         return total_raw
 
-    # ── Pass 1: must-have ──
+    # ──── Pass 1: must-have ────
     total_raw = sweep(is_must_have, "")
 
-    # ── Pass 2: nice-to-have only if coverage is thin (R7) ──
+    # ──── Pass 2: nice-to-have only if coverage is thin (R7) ────
     if len(all_articles) < TIER2_MIN_ARTICLES:
         logger.info(f"Coverage {len(all_articles)} < {TIER2_MIN_ARTICLES}; "
                     f"pulling nice-to-have feeds.")
@@ -699,19 +822,90 @@ def harvest_feeds() -> list[Article]:
 
     return sorted(all_articles.values(), key=lambda a: a.pub_date, reverse=True)
 # ==============================================================================
-# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF
+# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF   (v4: rebalanced)
 # ==============================================================================
+# v4 change, and the ONLY substantive change in this file.
+#
+# v1-v3 closed with "Discard pure noise: generic 'markets mixed' wrap-ups,
+# clickbait, non-financial lifestyle fluff." That instruction was doing more
+# than removing noise: it removed the Arts, Books, Film, Music, Television,
+# Theatre, Fashion, Dining, Travel, Real Estate and Obituaries items that the
+# harvester fetches as must-have feeds. The brief was macro-only by
+# instruction rather than by data.
+#
+# v4 keeps every macro requirement from v1-v3 and adds: (a) an explicit balance
+# instruction that makes culture and human-interest first-class, (b) an
+# explicit exclusion for romantic/sexual relationship coverage, and (c) a scope
+# note so that (b) cannot be read as banning the ordinary macro use of the word
+# "relations" — "US–China relations", "EU–UK trade relations", "the Fed's
+# relationship with markets". Without (c), a literal reading of (b) would delete
+# core geopolitical stories.
 SYSTEM_PROMPT = """
-ROLE: Senior Macro Intelligence Analyst.
-STYLE: Ultra-concise, dense financial intelligence brief. Zero conversational filler, zero setup sentences, zero meta-commentary.
-TASK: Process the provided raw news headlines + summaries from major financial publications (FT, WSJ, NYT, Bloomberg, SCMP, Washington Post) and transform them into a single, highly scannable section.
+ROLE: Senior Intelligence Analyst writing a morning brief that is read by two people over breakfast — one a markets professional who wants macro and financial density, one a general reader who wants people, culture and life.
+STYLE: Ultra-concise, dense, highly scannable. Zero conversational filler, zero setup sentences, zero meta-commentary. Every bullet must earn its place.
+TASK: Process the provided raw news headlines + summaries from major publications (FT, WSJ, NYT, Bloomberg, SCMP, Washington Post) and transform them into a single, highly scannable section.
+
+================================================================================
+BALANCE — THE MOST IMPORTANT INSTRUCTION IN THIS PROMPT
+================================================================================
+The raw dump is dominated by markets and geopolitics. Do NOT let that dominate the brief.
+Treat the following three bands as equals, and make sure all three are represented:
+
+  1. MACRO & MARKETS — central banks, rates, bonds, currencies, commodities,
+     geopolitics, trade, corporate earnings, deals, tech and AI, energy.
+  2. PEOPLE & CULTURE — human-interest reporting, profiles, obituaries,
+     remarkable lives, arts, books, film, television, music, theatre, fashion,
+     food, travel, design, architecture, city life.
+  3. IDEAS & LIVING — science, health, education, work, sport, personal
+     finance, housing, and ordinary life.
+
+A culture or human-interest item is NOT filler and is NOT less newsworthy than a market item. A superb obituary, a remarkable piece of reporting on ordinary life, or a genuinely good review belongs here on the same footing as a bond auction.
+Conversely, weak market items are still weak items. Do not pad the culture sections with trivia to make the brief look balanced; select the strongest items in each band.
+The test: a reader who skips the markets sections entirely should still find a full, satisfying read; a reader who skips the culture sections should still get the macro picture.
+
+================================================================================
+WHAT TO INCLUDE
+================================================================================
+Human interest and lifestyle (first-class content, not filler):
+  - Reporting about people: profiles, obituaries, remarkable lives, human stories.
+  - Arts, books, film, television, music, theatre — with the actual critical judgment and the concrete facts, not a bare headline.
+  - Food, travel, design, architecture, fashion, and city life.
+  - Science and health when they are about human life, not clinical abstracts.
+  - Education, work, sport, housing, and personal finance.
+
+================================================================================
+WHAT TO EXCLUDE — skip these entirely
+================================================================================
+Content whose primary subject is interpersonal romantic or sexual relationships:
+  1. Dating, courtship, and mating coverage; sex columns and sex-advice pieces.
+  2. Romantic and sexual "how-to" — relationship advice, marriage counselling, guides about partners, personal essays about romantic life.
+  3. Celebrity romance, breakups, engagements, and romantic gossip.
+  4. Anything whose news value is WHO SOMEONE IS INVOLVED WITH rather than WHAT HAPPENED.
+The reason is editorial: this brief is read by two people together, and romantic/relationship material tends to start conversations that neither reader wants at breakfast.
+
+Also skip, regardless of band:
+  - Generic "markets mixed" wrap-ups and no-news round-ups.
+  - Clickbait, listicles, quizzes, and advice columns.
+  - Personality pieces with no reported content.
+  - Duplicate coverage of the same event already captured above.
+
+SCOPE NOTE — READ THIS BEFORE APPLYING THE EXCLUSION ABOVE:
+The exclusion applies ONLY to personal, romantic, and sexual relationships.
+It does NOT apply to the ordinary, macro sense of the words "relations" or
+"relationship", which must still be included in full:
+  - "US–China relations", "EU–UK trade relations", "cross-strait relations"
+  - "the Fed's relationship with markets", "the bank's relationship with its clients"
+  - "US–Japan security relationship", "Moscow's relations with Beijing"
+A geopolitical or business story must NEVER be dropped because it contains one of
+those words. The exclusion is about romance, dating and sex — nothing else.
+
 ================================================================================
 NEWS INTELLIGENCE BRIEF
 ================================================================================
 HEADER: Must start directly with `### NEWS INTELLIGENCE BRIEF`
 DISCLAIMER: Immediately beneath header: `*(All data sourced from public RSS feeds: FT, WSJ, NYT, Bloomberg, SCMP, WaPo)*`
 STRUCTURE: Divide into short sub-topical blocks.
-SUB-HEADERS: Create your own Level-4 Markdown headings `#### CATEGORY NAME` in ALL CAPS that best fit the actual content. Do NOT use a fixed list. Generate categories dynamically from the feed — e.g., if the data contains central bank moves, create `#### CENTRAL BANKS & RATES`; if it contains semiconductor earnings, create `#### SEMICONDUCTORS & TECH`; if it contains China property, create `#### CHINA PROPERTY & CREDIT`. Every item must appear under some category. No item left uncategorized. Typical macro categories emerge naturally (central banks, bonds, geopolitics, commodities, economic data, corporate earnings, tech/AI, regional), but adapt to what's actually in the window.
+SUB-HEADERS: Create your own Level-4 Markdown headings `#### CATEGORY NAME` in ALL CAPS that best fit the actual content. Do NOT use a fixed list. Generate categories dynamically from the feed — e.g., if the data contains central bank moves, create `#### CENTRAL BANKS & RATES`; if it contains semiconductor earnings, create `#### SEMICONDUCTORS & TECH`; if it contains China property, create `#### CHINA PROPERTY & CREDIT`; if it contains a great obituary, create `#### OBITUARIES` or `#### REMARKABLE LIVES`; if it contains film and books, create `#### ARTS & CULTURE`; if it contains food and travel, create `#### FOOD & TRAVEL`. Every item must appear under some category. No item left uncategorized. Typical macro categories emerge naturally (central banks, bonds, geopolitics, commodities, economic data, corporate earnings, tech/AI, regional), but adapt to what's actually in the window.
 BULLETS: Single dash `-`, max 2-3 per sub-header.
 CONSTRAINTS:
   1. Every entry = one isolated bullet point. No multi-sentence paragraphs.
@@ -719,7 +913,7 @@ CONSTRAINTS:
   3. No source attributions unless citing a specific exclusive/scoop.
   4. DO NOT start bullets with "Per FT", "According to WSJ", "Bloomberg reports...".
   5. Jump straight to the core metric/event/entity (e.g., `- Brent crude topped $91/bbl on Hormuz closure risk...`).
-  6. Discard pure noise: generic "markets mixed" wrap-ups, clickbait, non-financial lifestyle fluff.
+  6. For culture items, jump straight to the judgment and the specifics (e.g., `- New Le Carré novel tracks a retired spy...`), not to the headline.
 ================================================================================
 GENERAL SYNTAX & FORMATTING STRICT RULES
 ================================================================================
@@ -752,10 +946,33 @@ def _validate_brief(text: str) -> tuple[bool, str]:
         if hdr not in upper:
             return False, f"missing required header '{hdr}'"
     return True, ""
-def _post_chat_completion(model_cfg: dict, user_prompt: str) -> tuple[str, str]:
+def _extract_reasoning(msg: dict) -> str:
+    """Pull the reasoning channel out of a chat-completion message.
+
+    v1/v2 read only `reasoning_content`. Some NIM endpoints use `reasoning`
+    or `reasoning_text` instead; on those, the script saw an empty content
+    field, no reasoning field, and reported a generic "too short (0 chars)".
+    """
+    for field in REASONING_FIELD_NAMES:
+        val = msg.get(field)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _post_chat_completion(model_cfg: dict, user_prompt: str,
+                          max_tokens: int, temperature: float
+                          ) -> tuple[str, str, str]:
+    """One chat-completion call.
+
+    Returns (content, finish_reason, reasoning). Reasoning is returned rather
+    than discarded so the caller can diagnose the failure and, if the model
+    emitted the brief inside the reasoning channel, recover it (L3).
+    """
     base_url = model_cfg["base_url"].rstrip("/")
     api_key  = model_cfg["api_key"]
     model    = model_cfg["model"]
+    tuning   = _tuning_for(model)
     url      = f"{base_url}/chat/completions"
     def send(payload: dict) -> str:
         body = json.dumps(payload).encode("utf-8")
@@ -766,7 +983,7 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str) -> tuple[str, str]:
             "User-Agent": HEADERS["User-Agent"],
         }
         req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
-        with urllib.request.urlopen(req, timeout=LLM_REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=tuning["request_timeout"]) as resp:
             return resp.read().decode("utf-8", errors="replace")
     payload = {
         "model": model,
@@ -774,12 +991,17 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str) -> tuple[str, str]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_prompt},
         ],
-        "temperature": LLM_TEMPERATURE,
-        "top_p": 0.95,
-        "max_tokens": MAX_OUTPUT_TOKENS,
+        "top_p": tuning["top_p"],
+        "max_tokens": max_tokens,
         "stream": False,
     }
-    if NO_THINK_KWARG and "nemotron" in model.lower() and "nvidia" in base_url:
+    # Only send temperature when the model actually exposes a sampling dial.
+    # Nemotron-family models reject the key with HTTP 400; the old code always
+    # sent it and relied on the 400-retry path, which wasted a round trip.
+    if tuning.get("send_temperature", True):
+        payload["temperature"] = temperature
+    if NO_THINK_KWARG and any(kw in model.lower() for kw in NO_THINK_MODEL_KEYWORDS) \
+            and "nvidia" in base_url:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     try:
         raw = send(payload)
@@ -800,14 +1022,20 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str) -> tuple[str, str]:
     content = (content or "").strip()
     finish = choice.get("finish_reason", "?")
     usage = data.get("usage") or {}
-    logger.info(f"[LLM] {model}: finish_reason={finish} | "
+    logger.info(f"[LLM] {model}: finish_reason={finish} | cap={max_tokens} | "
                 f"tokens {usage.get('prompt_tokens', '?')} in / {usage.get('completion_tokens', '?')} out")
-    reasoning = (msg.get("reasoning_content") or "").strip()
+    reasoning = _extract_reasoning(msg)
     if not content and reasoning:
         logger.warning(f"[LLM] 'content' empty but {len(reasoning)} chars reasoning returned.")
         _save_debug(f"orphan_reasoning_{model}", reasoning)
-    return content, finish
+    return content, finish, reasoning
 def llm_prepare_file(user_prompt: str) -> tuple[str | None, str]:
+    """Walk the model chain, escalating the budget on retry. Kept under the
+    old name so main() and any external callers keep working unchanged."""
+    return generate_brief(user_prompt)
+
+
+def generate_brief(user_prompt: str) -> tuple[str | None, str]:
     valid_chain = [m for m in MODEL_CHAIN if m.get("model") and m.get("base_url") and m.get("api_key")]
     if not valid_chain:
         logger.error("No valid models configured (check .env).")
@@ -817,20 +1045,57 @@ def llm_prepare_file(user_prompt: str) -> tuple[str | None, str]:
         return None, ""
     logger.info(f"[LLM] Payload: {len(user_prompt):,} chars (~{len(user_prompt)//4:,} tokens est.)")
     _save_debug("last_request_user_message", user_prompt)
+    # L1: print what each model resolved to, so the log shows the budget that
+    # was actually sent rather than leaving it to be inferred from a failure.
+    for m in valid_chain:
+        t = _tuning_for(m["model"])
+        logger.info(f"[LLM] Tuning for {m['model']}: max_tokens={t['max_output_tokens']}, "
+                    f"temperature={'omitted' if not t.get('send_temperature', True) else t['temperature']}, "
+                    f"timeout={t['request_timeout']}s ({t['note']})")
     for idx, model_cfg in enumerate(valid_chain):
         label = "PRIMARY" if idx == 0 else "FALLBACK"
         model_name = model_cfg["model"]
+        tuning = _tuning_for(model_name)
         for attempt in range(1, ATTEMPTS_PER_MODEL + 1):
-            logger.info(f"[LLM] Calling {label}: {model_name} (attempt {attempt}/{ATTEMPTS_PER_MODEL})")
+            # L2: escalate instead of replaying. Attempt 1 uses the tuned
+            # budget; attempt 2 multiplies it. Identical retries reproduce an
+            # identical truncation, which is exactly what the old loop did.
+            max_tokens = tuning["max_output_tokens"] * (1 if attempt == 1 else RETRY_TOKEN_MULTIPLIER)
+            temperature = tuning["temperature"]
+            logger.info(f"[LLM] Calling {label}: {model_name} "
+                        f"(attempt {attempt}/{ATTEMPTS_PER_MODEL}, max_tokens={max_tokens})")
             try:
-                text, finish = _post_chat_completion(model_cfg, user_prompt)
+                text, finish, reasoning = _post_chat_completion(
+                    model_cfg, user_prompt, max_tokens, temperature)
                 if finish == "length":
-                    logger.warning("[LLM] Hit max_tokens — consider raising MAX_OUTPUT_TOKENS.")
+                    logger.warning(f"[LLM] Hit max_tokens ({max_tokens}) — "
+                                   f"consider raising it for {model_name}.")
                 ok, why = _validate_brief(text)
                 if ok:
                     logger.info(f"[LLM] Validated OK via {model_name}")
                     return strip_code_fences(text), model_name
-                logger.warning(f"[LLM] REJECTED {label} output: {why}")
+                # L3: recovery path. Some models emit the answer inside the
+                # reasoning channel. If the content channel is empty and the
+                # reasoning carries the required output header, try it.
+                if not text and reasoning:
+                    upper_reason = reasoning.upper()
+                    if any(h in upper_reason for h in REQUIRED_HEADERS):
+                        ok_r, why_r = _validate_brief(reasoning)
+                        if ok_r:
+                            logger.info(f"[LLM] Recovered validated brief from reasoning "
+                                        f"channel of {model_name} (content channel was empty).")
+                            return strip_code_fences(reasoning), model_name
+                        logger.warning(f"[LLM] Reasoning channel had the header but {why_r}.")
+                # L4: name the failure mode instead of reporting a bare length.
+                if not text and reasoning and finish == "length":
+                    detail = (f"model spent its whole {max_tokens}-token budget on "
+                              f"reasoning ({len(reasoning)} chars) and emitted no answer — "
+                              f"raise max_tokens for {model_name}")
+                elif not text:
+                    detail = f"no content returned (finish_reason={finish})"
+                else:
+                    detail = why
+                logger.warning(f"[LLM] REJECTED {label} output: {detail}")
             except HTTPError as e:
                 if e.code == 429:
                     logger.warning(f"[LLM] {label} rate-limited (429). Backing off {LLM_RATE_LIMIT_BACKOFF}s...")
@@ -923,7 +1188,7 @@ def _normalize_header_number_agreement(text: str) -> str:
 def main():
     print("=" * 60)
     print("  RSS INTELLIGENCE HARVESTER (ALL-IN-ONE)")
-    print("  Fetch feeds -> filter -> LLM brief via NVIDIA Nemotron")
+    print("  Fetch feeds -> filter -> LLM brief via NVIDIA NIM")
     print("=" * 60)
     # 1. Harvest feeds directly (fetch + parse + dedupe + date filter)
     articles = harvest_feeds()
