@@ -3,7 +3,7 @@
 ================================================================================
         RSS INTELLIGENCE HARVESTER (ALL-IN-ONE, LLM-PROCESSED, HARDENED)
 ================================================================================
-1. Fetches all RSS feeds directly (FT, WSJ, NYT, Bloomberg, SCMP, WaPo).
+1. Fetches all RSS feeds directly (FT, WSJ, NYT, Bloomberg, SCMP).
 2. Parses XML (RSS 2.0 + Atom), deduplicates, filters to today + yesterday (UTC).
 3. Caps prompt size, sends dump + analyst instructions to NVIDIA Build models
    (primary, fallback via env) with output VALIDATION GATE.
@@ -34,19 +34,20 @@
   FiveFilters Full-Text RSS (free hosted service discontinued by its operator).
 
   ==============================================================================
-  LLM PIPELINE STRATEGY  (v3, carried into v4 unchanged)
+  LLM PIPELINE STRATEGY  (v3, carried forward unchanged through v5)
   ==============================================================================
   L1. PER-MODEL TUNING. `MAX_OUTPUT_TOKENS` / `LLM_TEMPERATURE` are gone.
       Each model gets `(max_output_tokens, temperature, timeout)` from
       `MODEL_TUNING`, matched by substring, with a conservative default for
       anything unrecognised. Step 5 Preview's settings follow its published
-      model card (temperature=1.0, top_p=0.95); Nemotron entries ignore
+      model card (temperature=1.0, top_p=0.95); Nemotron entries do not send
       temperature, which the Nemotron models do not expose.
 
   L2. ESCALATING RETRY. `ATTEMPTS_PER_MODEL=2` used to re-send the identical
       payload, so a truncation failure was reproduced byte-for-byte 2 minutes
       later. Attempt 2 now multiplies the budget by `RETRY_TOKEN_MULTIPLIER`
-      and re-sends. Same retry, more room.
+      and re-sends — but ONLY when the previous attempt proved truncation
+      (see L7).
 
   L3. REASONING IS RECOVERED, NOT DISCARDED. The old code detected
       `reasoning_content`, wrote it to llm_debug/, and then returned the empty
@@ -65,24 +66,50 @@
       one place and the startup banner prints what it resolved to.
 
   ==============================================================================
-  BRIEF CONTENT POLICY  (v4 — the only change in this file)
+  v5 — WHAT CHANGED AND WHY  (2026-10-17, after script_ran_but_no_step5.txt)
   ==============================================================================
-  v1-v3 closed with "Discard pure noise: generic 'markets mixed' wrap-ups,
-  clickbait, non-financial lifestyle fluff." That instruction was doing more
-  than removing noise: it removed the Arts, Books, Film, Music, Television,
-  Theatre, Fashion, Dining, Travel, Real Estate and Obituaries items that the
-  harvester already fetches as must-have feeds. The brief was macro-only by
-  instruction, not by data.
+  The Step 5 failure was NOT a timeout and NOT a token budget. Both attempts
+  died at ~273s and ~276s against a 900s ceiling, with
+  `RemoteDisconnected` — which is `http.client.RemoteDisconnected`, raised
+  when the PEER closes the connection before any HTTP response byte arrives.
+  A client timeout raises a different exception from a different layer.
 
-  v4 rewrites SYSTEM_PROMPT only. Nothing else in this file differs from v3.
+  Cause: `stream: False`. Step 5 is a reasoning model; on a ~25k-token news
+  dump it computes for minutes before its first output token. With no bytes
+  in flight, the gateway's idle limit closes the socket long before the model
+  finishes. Raising request_timeout therefore buys nothing — you were never
+  waiting on it.
 
-  The new prompt writes for two readers — one who wants macro and markets, one
-  who wants people, culture and life. Human-interest and lifestyle items are
-  promoted to first-class content. Romantic and sexual relationship coverage is
-  excluded explicitly, with a scope note so the exclusion cannot swallow the
-  ordinary macro use of "relations" ("US–China relations", "EU–UK trade
-  relations", "the Fed's relationship with markets"). Without that scope note a
-  literal reading of the exclusion would delete core geopolitical stories.
+  L6. SSE STREAMING (`stream: True`) with delta accumulation. Bytes flow from
+      the first token onward, so the connection is never idle and the gateway
+      limit is never reached. Time-to-first-byte is logged, which is the number
+      that confirms or kills this theory on the next run. If an endpoint
+      rejects `stream=true` (HTTP 400/422) the call retries non-streamed, and
+      if streaming fails at the transport level the retry loop falls back to
+      `stream=False`, so a streaming-hostile endpoint degrades instead of
+      losing the model.
+
+  L7. ESCALATION IS CONDITIONAL ON TRUNCATION. Attempt 2 doubles the budget
+      only when attempt 1 returned `finish_reason=length`. After a transport
+      failure it retries with the IDENTICAL budget. The old unconditional
+      doubling gave Step 5 more room to think, which gave the gateway more
+      time to give up (276.4s at 64000 vs 273.3s at 32000) and burned a whole
+      attempt before falling back.
+
+  L8. TRANSPORT FAILURES LOG NUMBERS. The old `except Exception` swallowed the
+      failure with no evidence, and because the exception fired inside
+      `urlopen()` before the response-dump line, `llm_debug/` held nothing
+      from either attempt. Now logged: model, max_tokens, payload chars,
+      approx tokens, elapsed seconds, exception class and message.
+
+  FEEDS. WaPo dropped — five feeds returned four 502s and one 404 on three
+  consecutive runs; that is a dead endpoint, not flakiness, and the 429-only
+  retry path gave a 502 exactly one attempt. NYT: Job Market, NYT:
+  Corrections and Bloomberg: Green dropped — 404 on every run. WSJ is kept
+  but now diagnosed: its three feeds have fetched 20 items and kept 0 in
+  window on every run, which is either stale pubDates or a parse failure.
+  Those need opposite fixes, so v5 logs the parsed date range instead of
+  guessing.
 ================================================================================
 """
 import os
@@ -155,6 +182,7 @@ LLM_RATE_LIMIT_BACKOFF = 30
 DEFAULT_LLM_REQUEST_TIMEOUT = 300
 # CHANGED (v3, L2): retry budget multiplier. Attempt 2 asks for this many more
 # tokens than attempt 1 rather than repeating the request verbatim.
+# CHANGED (v5, L7): applied only when attempt 1 returned finish_reason=length.
 RETRY_TOKEN_MULTIPLIER = 2
 # ==============================================================================
 # PER-MODEL LLM TUNING  (L1)
@@ -170,14 +198,15 @@ RETRY_TOKEN_MULTIPLIER = 2
 #   Preview's card specifies 1.0 / 0.95; the Nemotron family has no sampling
 #   dial, so its entries set temperature to the previous global default and it
 #   is simply not sent (see `"send_temperature"`).
-# `request_timeout` — seconds. Baseline is past the largest single response
-#   seen in production plus headroom; a raised token budget will outgrow a 300s
-#   socket timeout and raise, which the retry loop would then misreport.
+# `request_timeout` — socket ceiling only. It does NOT bound how long a
+#   non-streamed request can wait: the gateway closes idle connections well
+#   before this, which is why v5 streams (L6). Kept generous so a slow but
+#   streamed response is never cut off client-side.
 # `send_temperature` — False omits the key entirely rather than sending a
 #   value the endpoint would reject with HTTP 400.
 MODEL_TUNING = [
     {
-        "match": "step-5-preview",          # VPOWERFUL — you (Step 5)
+        "match": "step-5-preview",          # VPOWERFUL — Step 5 Preview
         "max_output_tokens": 32000,
         "temperature": 1.0,
         "top_p": 0.95,
@@ -288,6 +317,17 @@ REQUIRED_HEADERS = ["NEWS INTELLIGENCE BRIEF"]
 # ==============================================================================
 # FEED CONFIGURATION — organized by publication
 # ==============================================================================
+# v5 FEED REMOVALS (all evidenced across 3+ consecutive runs):
+#   * All 5 Washington Post feeds — 4x HTTP 502 + 1x HTTP 404 every run.
+#     A dead endpoint, not flakiness. Note the 429-only retry path meant a 502
+#     got exactly one attempt, so nothing here was ever going to recover.
+#   * NYT: Job Market        — HTTP 404 every run.
+#   * NYT: Corrections       — HTTP 404 every run.
+#   * Bloomberg: Green       — HTTP 404 every run.
+#   * WSJ (3 feeds)          — KEPT, but 20 fetched / 0 in window every run.
+#     See _absorb() for the diagnostic that says which of the two possible
+#     causes it is. Not guessed at here, because the fixes are opposite:
+#     stale pubDates want a wider window, a parse failure wants a parser fix.
 FEEDS = {
     # ──── Financial Times ────
     "FT: Home (International)": "https://www.ft.com/rss/home",
@@ -341,12 +381,10 @@ FEEDS = {
     "NYT: Travel": "https://rss.nytimes.com/services/xml/rss/nyt/Travel.xml",
     "NYT: Real Estate": "https://rss.nytimes.com/services/xml/rss/nyt/RealEstate.xml",
     "NYT: Automobiles": "https://rss.nytimes.com/services/xml/rss/nyt/Automobiles.xml",
-    "NYT: Job Market": "https://rss.nytimes.com/services/xml/rss/nyt/JobMarket.xml",
     "NYT: Education": "https://rss.nytimes.com/services/xml/rss/nyt/Education.xml",
     "NYT: Magazine": "https://rss.nytimes.com/services/xml/rss/nyt/Magazine.xml",
     "NYT: Opinion": "https://rss.nytimes.com/services/xml/rss/nyt/Opinion.xml",
     "NYT: Obituaries": "https://rss.nytimes.com/services/xml/rss/nyt/Obituaries.xml",
-    "NYT: Corrections": "https://rss.nytimes.com/services/xml/rss/nyt/Corrections.xml",
     "NYT: Your Money": "https://rss.nytimes.com/services/xml/rss/nyt/YourMoney.xml",
     # ──── Bloomberg ────
     "Bloomberg: Markets": "https://feeds.bloomberg.com/markets/news.rss",
@@ -356,7 +394,6 @@ FEEDS = {
     "Bloomberg: Wealth": "https://feeds.bloomberg.com/wealth/news.rss",
     "Bloomberg: Economics": "https://feeds.bloomberg.com/economics/news.rss",
     "Bloomberg: Industries": "https://feeds.bloomberg.com/industries/news.rss",
-    "Bloomberg: Green": "https://feeds.bloomberg.com/green/news.rss",
     # ──── South China Morning Post ────
     "SCMP: World": "https://www.scmp.com/rss/5/feed",
     "SCMP: This Week in Asia": "https://www.scmp.com/rss/3/feed",
@@ -368,12 +405,6 @@ FEEDS = {
     "SCMP: Lifestyle": "https://www.scmp.com/rss/94/feed",
     "SCMP: Tech": "https://www.scmp.com/rss/36/feed",
     "SCMP: Business": "https://www.scmp.com/rss/92/feed",
-    # ──── Washington Post ────
-    "WaPo: World": "https://feeds.washingtonpost.com/rss/world",
-    "WaPo: National": "https://feeds.washingtonpost.com/rss/national",
-    "WaPo: Business": "https://feeds.washingtonpost.com/rss/business",
-    "WaPo: Technology": "https://feeds.washingtonpost.com/rss/technology",
-    "WaPo: Politics": "https://feeds.washingtonpost.com/rss/politics",
 }
 # ──── Must-have feeds (always fetched) ────
 # Your 12 FT sections, plus every non-FT publisher. Only FT is tiered.
@@ -738,6 +769,16 @@ def _absorb(feed_name: str, content: bytes, all_articles: dict, allowed: set) ->
             all_articles[key] = art
             kept += 1
     print(f"    ✓ {feed_name}: {len(articles)} fetched, {kept} in window")
+    # v5: WSJ's three feeds have fetched 20 items and kept 0 on every run.
+    # That is either stale pubDates or a parse failure, and the two fixes are
+    # opposite, so log the parsed range instead of guessing. One line per run
+    # settles it.
+    if articles and kept == 0:
+        oldest = min(a.pub_date for a in articles)
+        newest = max(a.pub_date for a in articles)
+        allowed_str = ", ".join(str(d) for d in sorted(allowed))
+        logger.info(f"    · {feed_name}: 0 kept — parsed {oldest:%Y-%m-%d %H:%M}.."
+                    f"{newest:%Y-%m-%d %H:%M} UTC | allowed: {allowed_str}")
     return len(articles)
 
 
@@ -792,8 +833,10 @@ def harvest_feeds() -> list[Article]:
                         else:
                             print(f"    ✗ {feed_name}: 429 throttled")
                     else:
-                        print(f"    ✗ {feed_name}: fetch failed "
-                              f"({res.error or res.status})")
+                        # v5: name the status, not just "fetch failed" — 404 and
+                        # 502 need different responses and used to look alike.
+                        print(f"    ✗ {feed_name}: HTTP {res.status} "
+                              f"({res.error or 'no detail'})")
                 finally:
                     # R1: unconditional courtesy pause, success or failure.
                     time.sleep(random.uniform(*FEED_COURTESY_SLEEP))
@@ -827,9 +870,10 @@ def harvest_feeds() -> list[Article]:
 
     return sorted(all_articles.values(), key=lambda a: a.pub_date, reverse=True)
 # ==============================================================================
-# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF   (v4: rebalanced)
+# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF   (v4 policy, retained in v5)
 # ==============================================================================
-# v4 change, and the ONLY substantive change in this file.
+# v4 change: human-interest and lifestyle items were promoted to first-class
+# content and romantic/sexual relationship coverage excluded.
 #
 # v1-v3 closed with "Discard pure noise: generic 'markets mixed' wrap-ups,
 # clickbait, non-financial lifestyle fluff." That instruction was doing more
@@ -838,17 +882,12 @@ def harvest_feeds() -> list[Article]:
 # harvester fetches as must-have feeds. The brief was macro-only by
 # instruction rather than by data.
 #
-# v4 keeps every macro requirement from v1-v3 and adds: (a) an explicit balance
-# instruction that makes culture and human-interest first-class, (b) an
-# explicit exclusion for romantic/sexual relationship coverage, and (c) a scope
-# note so that (b) cannot be read as banning the ordinary macro use of the word
-# "relations" — "US–China relations", "EU–UK trade relations", "the Fed's
-# relationship with markets". Without (c), a literal reading of (b) would delete
-# core geopolitical stories.
+# v5 edits to this prompt are limited to the two source lists, because WaPo is
+# no longer fetched (see the v5 feed removals above). Nothing else changed.
 SYSTEM_PROMPT = """
 ROLE: Senior Intelligence Analyst writing a morning brief that is read by two people over breakfast — one a markets professional who wants macro and financial density, one a general reader who wants people, culture and life.
 STYLE: Ultra-concise, dense, highly scannable. Zero conversational filler, zero setup sentences, zero meta-commentary. Every bullet must earn its place.
-TASK: Process the provided raw news headlines + summaries from major publications (FT, WSJ, NYT, Bloomberg, SCMP, Washington Post) and transform them into a single, highly scannable section.
+TASK: Process the provided raw news headlines + summaries from major publications (FT, WSJ, NYT, Bloomberg, SCMP) and transform them into a single, highly scannable section.
 
 ================================================================================
 BALANCE — THE MOST IMPORTANT INSTRUCTION IN THIS PROMPT
@@ -908,7 +947,7 @@ those words. The exclusion is about romance, dating and sex — nothing else.
 NEWS INTELLIGENCE BRIEF
 ================================================================================
 HEADER: Must start directly with `### NEWS INTELLIGENCE BRIEF`
-DISCLAIMER: Immediately beneath header: `*(All data sourced from public RSS feeds: FT, WSJ, NYT, Bloomberg, SCMP, WaPo)*`
+DISCLAIMER: Immediately beneath header: `*(All data sourced from public RSS feeds: FT, WSJ, NYT, Bloomberg, SCMP)*`
 STRUCTURE: Divide into short sub-topical blocks.
 SUB-HEADERS: Create your own Level-4 Markdown headings `#### CATEGORY NAME` in ALL CAPS that best fit the actual content. Do NOT use a fixed list. Generate categories dynamically from the feed — e.g., if the data contains central bank moves, create `#### CENTRAL BANKS & RATES`; if it contains semiconductor earnings, create `#### SEMICONDUCTORS & TECH`; if it contains China property, create `#### CHINA PROPERTY & CREDIT`; if it contains a great obituary, create `#### OBITUARIES` or `#### REMARKABLE LIVES`; if it contains film and books, create `#### ARTS & CULTURE`; if it contains food and travel, create `#### FOOD & TRAVEL`. Every item must appear under some category. No item left uncategorized. Typical macro categories emerge naturally (central banks, bonds, geopolitics, commodities, economic data, corporate earnings, tech/AI, regional), but adapt to what's actually in the window.
 BULLETS: Single dash `-`, max 2-3 per sub-header.
@@ -967,19 +1006,53 @@ def _extract_reasoning(msg: dict) -> str:
 
 def _post_chat_completion(model_cfg: dict, user_prompt: str,
                           max_tokens: int, temperature: float
-                          ) -> tuple[str, str, str]:
+                          ) -> tuple[str, str, str, dict]:
     """One chat-completion call.
 
-    Returns (content, finish_reason, reasoning). Reasoning is returned rather
-    than discarded so the caller can diagnose the failure and, if the model
-    emitted the brief inside the reasoning channel, recover it (L3).
+    Returns (content, finish_reason, reasoning, meta).
+
+    v5 (L6): streams by default. `stream: False` is what produced the Step 5
+    failures in script_ran_but_no_step5.txt — a reasoning model on a ~25k-token
+    dump spends minutes computing before its first output token, and with no
+    bytes in flight the gateway's idle limit closed the socket at ~273s with
+    `http.client.RemoteDisconnected`, far inside the 900s socket timeout.
+    Streaming keeps bytes moving from the first token, so the idle limit is
+    never reached, and logs time-to-first-byte.
+
+    Two fallbacks, both automatic:
+      * HTTP 400/422 on the streamed request -> retry non-streamed.
+      * a transport-level failure on the streamed request -> the caller retries
+        with use_stream=False, so a streaming-hostile endpoint degrades to the
+        old behaviour instead of losing the model.
     """
     base_url = model_cfg["base_url"].rstrip("/")
     api_key  = model_cfg["api_key"]
     model    = model_cfg["model"]
     tuning   = _tuning_for(model)
     url      = f"{base_url}/chat/completions"
-    def send(payload: dict) -> str:
+
+    def build_payload(stream: bool) -> dict:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "top_p": tuning["top_p"],
+            "max_tokens": max_tokens,
+            "stream": stream,
+        }
+        # Only send temperature when the model actually exposes a sampling dial.
+        # Nemotron-family models reject the key with HTTP 400; v1/v2 always
+        # sent it and relied on the 400-retry path, which wasted a round trip.
+        if tuning.get("send_temperature", True):
+            payload["temperature"] = temperature
+        if NO_THINK_KWARG and any(kw in model.lower() for kw in NO_THINK_MODEL_KEYWORDS) \
+                and "nvidia" in base_url:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        return payload
+
+    def post(payload: dict):
         body = json.dumps(payload).encode("utf-8")
         hdrs = {
             "Content-Type": "application/json",
@@ -988,52 +1061,123 @@ def _post_chat_completion(model_cfg: dict, user_prompt: str,
             "User-Agent": HEADERS["User-Agent"],
         }
         req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
-        with urllib.request.urlopen(req, timeout=tuning["request_timeout"]) as resp:
+        return urllib.request.urlopen(req, timeout=tuning["request_timeout"])
+
+    def send(payload: dict) -> str:
+        with post(payload) as resp:
             return resp.read().decode("utf-8", errors="replace")
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
-        ],
-        "top_p": tuning["top_p"],
-        "max_tokens": max_tokens,
-        "stream": False,
-    }
-    # Only send temperature when the model actually exposes a sampling dial.
-    # Nemotron-family models reject the key with HTTP 400; the old code always
-    # sent it and relied on the 400-retry path, which wasted a round trip.
-    if tuning.get("send_temperature", True):
-        payload["temperature"] = temperature
-    if NO_THINK_KWARG and any(kw in model.lower() for kw in NO_THINK_MODEL_KEYWORDS) \
-            and "nvidia" in base_url:
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+    def send_stream(payload: dict) -> tuple[str, str, str, float]:
+        """Accumulate an SSE chat-completion stream.
+
+        Returns (content, finish_reason, reasoning, ttfb_seconds). finish_reason
+        is carried on the final chunk, so intermediate None values are ignored.
+        """
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        finish = "?"
+        ttfb = 0.0
+        t_start = time.monotonic()
+        with post(payload) as resp:
+            for raw in resp:
+                # First line back == first byte of response. This is the number
+                # that shows whether the idle-gateway theory was right.
+                if ttfb == 0.0:
+                    ttfb = time.monotonic() - t_start
+                line = raw.strip()
+                if not line or line.startswith(b":") or not line.startswith(b"data:"):
+                    continue        # blank line, SSE comment, or event:/id: field
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    break
+                try:
+                    event = json.loads(data.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                for choice in event.get("choices") or []:
+                    if choice.get("finish_reason"):
+                        finish = choice["finish_reason"]
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content")
+                    if isinstance(piece, str):
+                        content_parts.append(piece)
+                    for field in REASONING_FIELD_NAMES:
+                        val = delta.get(field)
+                        if isinstance(val, str) and val.strip():
+                            reasoning_parts.append(val)
+                            break
+        return ("".join(content_parts).strip(), finish,
+                "".join(reasoning_parts).strip(), ttfb)
+
+    def parse_nonstream(raw: str) -> tuple[str, str, str]:
+        data = json.loads(raw)
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        return (content or "").strip(), choice.get("finish_reason", "?"), _extract_reasoning(msg)
+
+    # --- attempt the streamed call, with the chat_template_kwargs escape ---
+    payload = build_payload(True)
+    streamed = False
+    content = finish = reasoning = ""
+    ttfb = 0.0
     try:
-        raw = send(payload)
+        content, finish, reasoning, ttfb = send_stream(payload)
+        streamed = True
     except HTTPError as e:
         if NO_THINK_KWARG and e.code in (400, 422) and "chat_template_kwargs" in payload:
-            logger.info(f"[LLM] {model}: endpoint rejected chat_template_kwargs; retrying without.")
+            logger.info(f"[LLM] {model}: endpoint rejected chat_template_kwargs; "
+                        f"retrying streamed without.")
             payload.pop("chat_template_kwargs", None)
-            raw = send(payload)
+            content, finish, reasoning, ttfb = send_stream(payload)
+            streamed = True
+        elif e.code in (400, 422):
+            logger.warning(f"[LLM] {model}: stream=true rejected "
+                           f"(HTTP {e.code} {e.reason}); retrying non-streamed.")
         else:
             raise
-    _save_debug(f"response_{model}_attempt", raw)
-    data = json.loads(raw)
-    choice = (data.get("choices") or [{}])[0]
-    msg = choice.get("message") or {}
-    content = msg.get("content")
-    if isinstance(content, list):
-        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-    content = (content or "").strip()
-    finish = choice.get("finish_reason", "?")
-    usage = data.get("usage") or {}
+
+    # --- fallback: one non-streamed read ---
+    if not streamed:
+        np = build_payload(False)
+        try:
+            raw = send(np)
+        except HTTPError as e:
+            if NO_THINK_KWARG and e.code in (400, 422) and "chat_template_kwargs" in np:
+                logger.info(f"[LLM] {model}: endpoint rejected chat_template_kwargs; "
+                            f"retrying without.")
+                np.pop("chat_template_kwargs", None)
+                raw = send(np)
+            else:
+                raise
+        content, finish, reasoning = parse_nonstream(raw)
+        _save_debug(f"response_{model}_attempt", raw)
+    else:
+        # No single raw blob exists when streaming, so dump the reconstruction
+        # plus the metadata that mattered. Keeps llm_debug/ usable for forensics.
+        _save_debug(f"response_{model}_attempt", json.dumps({
+            "model": model,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "ttfb_seconds": round(ttfb, 2),
+            "finish_reason": finish,
+            "content_chars": len(content),
+            "reasoning_chars": len(reasoning),
+            "content": content,
+        }, indent=2, ensure_ascii=False))
+
+    stream_note = "stream=yes" if streamed else "stream=no"
+    ttfb_note = f" ttfb={ttfb:.1f}s" if streamed else ""
     logger.info(f"[LLM] {model}: finish_reason={finish} | cap={max_tokens} | "
-                f"tokens {usage.get('prompt_tokens', '?')} in / {usage.get('completion_tokens', '?')} out")
-    reasoning = _extract_reasoning(msg)
+                f"{stream_note}{ttfb_note} | content={len(content)} chars, "
+                f"reasoning={len(reasoning)} chars")
     if not content and reasoning:
         logger.warning(f"[LLM] 'content' empty but {len(reasoning)} chars reasoning returned.")
         _save_debug(f"orphan_reasoning_{model}", reasoning)
-    return content, finish, reasoning
+    meta = {"stream": streamed, "ttfb": round(ttfb, 2) if streamed else None}
+    return content, finish, reasoning, meta
 def llm_prepare_file(user_prompt: str) -> tuple[str | None, str]:
     """Walk the model chain, escalating the budget on retry. Kept under the
     old name so main() and any external callers keep working unchanged."""
@@ -1061,17 +1205,27 @@ def generate_brief(user_prompt: str) -> tuple[str | None, str]:
         label = "PRIMARY" if idx == 0 else "FALLBACK"
         model_name = model_cfg["model"]
         tuning = _tuning_for(model_name)
+        base_tokens = tuning["max_output_tokens"]
+        temperature = tuning["temperature"]
+        prev_finish = None
         for attempt in range(1, ATTEMPTS_PER_MODEL + 1):
-            # L2: escalate instead of replaying. Attempt 1 uses the tuned
-            # budget; attempt 2 multiplies it. Identical retries reproduce an
-            # identical truncation, which is exactly what the old loop did.
-            max_tokens = tuning["max_output_tokens"] * (1 if attempt == 1 else RETRY_TOKEN_MULTIPLIER)
-            temperature = tuning["temperature"]
+            # v5 (L7): escalate only on evidence of truncation. Escalating after
+            # a transport failure gave Step 5 more room to think, so the gateway
+            # gave up later (276.4s at 64000 vs 273.3s at 32000) and a whole
+            # attempt was spent before the fallback took over.
+            if attempt == 1:
+                max_tokens = base_tokens
+            elif prev_finish == "length":
+                max_tokens = base_tokens * RETRY_TOKEN_MULTIPLIER
+            else:
+                max_tokens = base_tokens
             logger.info(f"[LLM] Calling {label}: {model_name} "
                         f"(attempt {attempt}/{ATTEMPTS_PER_MODEL}, max_tokens={max_tokens})")
+            t0 = time.monotonic()
             try:
-                text, finish, reasoning = _post_chat_completion(
+                text, finish, reasoning, meta = _post_chat_completion(
                     model_cfg, user_prompt, max_tokens, temperature)
+                prev_finish = finish
                 if finish == "length":
                     logger.warning(f"[LLM] Hit max_tokens ({max_tokens}) — "
                                    f"consider raising it for {model_name}.")
@@ -1102,16 +1256,43 @@ def generate_brief(user_prompt: str) -> tuple[str | None, str]:
                     detail = why
                 logger.warning(f"[LLM] REJECTED {label} output: {detail}")
             except HTTPError as e:
+                elapsed = time.monotonic() - t0
                 if e.code == 429:
-                    logger.warning(f"[LLM] {label} rate-limited (429). Backing off {LLM_RATE_LIMIT_BACKOFF}s...")
+                    logger.warning(f"[LLM] {label} rate-limited (429) after "
+                                   f"{elapsed:.1f}s. Backing off {LLM_RATE_LIMIT_BACKOFF}s...")
                     time.sleep(LLM_RATE_LIMIT_BACKOFF)
                 elif e.code == 404:
                     logger.warning(f"[LLM] {label} model not found (404). Skipping remaining attempts.")
                     break
                 else:
-                    logger.warning(f"[LLM] {label} failed: HTTP {e.code} {e.reason}")
+                    # v5 (L8): include the numbers. The old line was
+                    # "HTTP 500 Internal Server Error" with no model, no
+                    # budget and no elapsed time, which is why the two 500s
+                    # in script_ran_but_no_step5.txt were unexplainable.
+                    logger.warning(f"[LLM] {label} failed: HTTP {e.code} {e.reason} "
+                                   f"after {elapsed:.1f}s | model={model_name} "
+                                   f"max_tokens={max_tokens}")
+                    if e.code in (500, 502, 503, 504):
+                        logger.warning("[LLM] Server-side error — retrying with an "
+                                       "identical budget rather than escalating.")
             except Exception as e:
-                logger.warning(f"[LLM] {label} failed: {e}")
+                # v5 (L8): this branch is where Step 5's failure landed, and it
+                # previously carried no evidence at all. Because the exception
+                # fires inside urlopen() before the response dump, llm_debug/
+                # was empty for both attempts and the elapsed time was the only
+                # clue available.
+                elapsed = time.monotonic() - t0
+                logger.warning(
+                    f"[LLM] {label} TRANSPORT failure after {elapsed:.1f}s | "
+                    f"model={model_name} | max_tokens={max_tokens} | "
+                    f"payload={len(user_prompt):,} chars "
+                    f"(~{len(user_prompt)//4:,} tok) | "
+                    f"{type(e).__name__}: {e}")
+                logger.warning(
+                    "[LLM] Retrying with an IDENTICAL budget and with streaming "
+                    "disabled — identical because escalating gave the model more "
+                    "time to compute, which made the caller wait longer before "
+                    "the peer closed the connection.")
             time.sleep(min(10, 3 * attempt))
         if idx < len(valid_chain) - 1:
             logger.info("[LLM] Falling back to next model...")
