@@ -264,6 +264,11 @@ TIER2_MIN_ARTICLES = 150
 # Contact string for the User-Agent. A real address can help you get treated
 # more leniently; leave the placeholder if you don't want to publish one.
 FEED_CONTACT = "fake_email@proton.me"
+# --- INPUT SIZE GUARDS ---
+MAX_CHARS_PER_ITEM = 500
+INPUT_CHAR_BUDGET = 100_000
+# --- THINKING MODE ---
+NO_THINK_KWARG = True
 # ==============================================================================
 # THINKING MODE
 # ==============================================================================
