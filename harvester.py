@@ -89,12 +89,18 @@
       `stream=False`, so a streaming-hostile endpoint degrades instead of
       losing the model.
 
+  CONFIRMED on the 2026-10-17 06:52 run. The primary model returned
+  `finish_reason=stop | stream=yes ttfb=1.7s | content=32089 chars,
+  reasoning=104925 chars` after a 690s generation, and validated OK. ttfb of
+  1.7s against the previous ~273s idle wall is the whole story: the socket
+  received bytes almost immediately this time and never went idle.
+
   L7. ESCALATION IS CONDITIONAL ON TRUNCATION. Attempt 2 doubles the budget
-      only when attempt 1 returned `finish_reason=length`. After a transport
-      failure it retries with the IDENTICAL budget. The old unconditional
-      doubling gave Step 5 more room to think, which gave the gateway more
-      time to give up (276.4s at 64000 vs 273.3s at 32000) and burned a whole
-      attempt before falling back.
+  only when attempt 1 returned `finish_reason=length`. After a transport
+  failure it retries with the IDENTICAL budget. The old unconditional
+  doubling gave Step 5 more room to think, which gave the gateway more
+  time to give up (276.4s at 64000 vs 273.3s at 32000) and burned a whole
+  attempt before falling back.
 
   L8. TRANSPORT FAILURES LOG NUMBERS. The old `except Exception` swallowed the
       failure with no evidence, and because the exception fired inside
@@ -106,10 +112,63 @@
   consecutive runs; that is a dead endpoint, not flakiness, and the 429-only
   retry path gave a 502 exactly one attempt. NYT: Job Market, NYT:
   Corrections and Bloomberg: Green dropped — 404 on every run. WSJ is kept
-  but now diagnosed: its three feeds have fetched 20 items and kept 0 in
-  window on every run, which is either stale pubDates or a parse failure.
-  Those need opposite fixes, so v5 logs the parsed date range instead of
-  guessing.
+  but the run log has now answered the question: see the WSJ block below.
+
+  ==============================================================================
+  v6 — WHAT CHANGED AND WHY  (2026-10-17, after successful_run.txt)
+  ==============================================================================
+  L9. GLM-5.3-FLASH JOINS THE CHAIN AS THE INTERMEDIATE MODEL, and
+      `NIM_ULTRA_POWERFUL_MODEL` — a secret that existed in the workflow env
+      from the start but was never read by the script — is now used. The
+      chain is: VPOWERFUL (Step 5 Preview, primary) -> ULTRA_POWERFUL
+      (z-ai/glm-5.3-flash) -> POWERFUL -> ULTRA -> LIGHTNING.
+
+      Placement rationale: GLM-5.3-Flash is a strong model with materially
+      worse latency than Step 5. It is a good SECOND call and a poor FIRST
+      call — if it were primary, every brief would wait on its latency even on
+      the days Step 5 would have answered first. Behind the primary it costs
+      nothing when Step 5 succeeds and only determines the run when it
+      doesn't. The 34,194-char index.html proves Step 5 still lands first in
+      practice, so GLM does not slow the daily job down.
+
+  ==============================================================================
+  v7 — WHAT CHANGED AND WHY  (2026-10-17, GLM budget at parity with Step 5)
+  ==============================================================================
+  v6 sized GLM-5.3-Flash at 24000 max_output_tokens on the theory that a
+  non-reasoning model needs no chain-of-thought headroom — the Nemotron
+  fallback had produced a validated brief in 1,781 tokens, so 24k looked like
+  ample room. That reasoning was sound on paper and wrong in posture: it bets
+  the intermediate model's success on the assumption that it stays small. The
+  failure modes are asymmetric. Over-budgeting costs nothing, because
+  `max_tokens` is a ceiling, not a target — an unused allowance is simply
+  unspent. Under-budgeting costs the run: `finish_reason=length`, a rejected
+  brief, and a fall through to Nemotron, which is exactly what position 2 was
+  added to avoid.
+
+  So GLM now matches Step 5 at 32000, with the doubled 1800s timeout retained
+  on top. Worth naming what did NOT change and why: the retry escalation still
+  treats the two identically (L7 — doubling to 64000 on `finish_reason=length`
+  only), because the mechanism is about the transport, not the model. If GLM's
+  ceiling still proves tight, the next move is `finish_reason=length` in the
+  log saying so, which is exactly what L4 was built to surface.
+
+  DIAGNOSED, NOT FIXED: WSJ. The three WSJ feeds have kept 0 items on every
+  run, and the diagnostic added in v5 has now answered why — parsed dates are
+  rooted in January 2025 (World News 2025-01-24..2025-01-27, Markets
+  2025-01-25..2025-01-27, US Business 2025-01-24). Every other stale feed in
+  the same run parsed correctly to within days of the window. The pubDates
+  are genuinely old, which means the fix is a wider lookback window for WSJ
+  specifically — NOT a parser change. That is deliberately left for a
+  follow-up rather than guessed at here, because a wider window interacts
+  with dedupe and with the prompt budget and deserves its own change.
+
+  Also observed in the same run and left alone deliberately: FT: China and
+  FT: Americas returned 0 in window with a parsed range ending 2026-10-17
+  04:00, i.e. they are fresh but simply carry nothing inside the window
+  today. That is normal feed variation, not a defect. Several NYT culture
+  feeds (Movies/Music/Television/Theater/Travel/Automobiles) also returned 0
+  with ranges that end on or near 2026-10-16 — again fresh items that missed
+  the window by hours, not broken parsing.
 ================================================================================
 """
 import os
@@ -145,7 +204,7 @@ loaded = load_dotenv()  # picks up .env in cwd if it exists
 print(f"load_dotenv returned: {loaded}")
 for var in ["NVIDIA_API_KEY", "NEMOTRON_ULTRA_MODEL",
             "NEMOTRON_LIGHTNING_MODEL", "NIM_POWERFUL_MODEL",
-            "NIM_VPOWERFUL_MODEL"]:
+            "NIM_ULTRA_POWERFUL_MODEL", "NIM_VPOWERFUL_MODEL"]:
     v = os.getenv(var)
     print(f"{var}: {'SET (len=%d)' % len(v) if v else 'MISSING'}")
 # --- Output config ---
@@ -159,10 +218,21 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NEMOTRON_ULTRA_MODEL = os.getenv("NEMOTRON_ULTRA_MODEL")
 NEMOTRON_LIGHTNING_MODEL = os.getenv("NEMOTRON_LIGHTNING_MODEL")
 NIM_POWERFUL_MODEL = os.getenv("NIM_POWERFUL_MODEL")
+NIM_ULTRA_POWERFUL_MODEL = os.getenv("NIM_ULTRA_POWERFUL_MODEL")
 NIM_VPOWERFUL_MODEL = os.getenv("NIM_VPOWERFUL_MODEL")
+# v6 (L9): the chain is ordered by preference, not by model strength. Step 5
+# Preview leads because latency, not quality, is what the daily job actually
+# cares about — it answered in 690s when it worked, and the fallback models
+# answer faster. GLM-5.3-Flash sits at position 2 because it is the best model
+# that is reachable when Step 5 is not: good enough that you want it over
+# Nemotron, slow enough that you do not want it first.
+#
+# Note `NIM_ULTRA_POWERFUL_MODEL` was already present in the workflow env from
+# the beginning but was never read by this script. It now is.
 MODEL_CHAIN = [
     m for m in [
         {"model": NIM_VPOWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
+        {"model": NIM_ULTRA_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
         {"model": NIM_POWERFUL_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
         {"model": NEMOTRON_ULTRA_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
         {"model": NEMOTRON_LIGHTNING_MODEL, "base_url": NVIDIA_API_BASE, "api_key": NVIDIA_API_KEY},
@@ -204,6 +274,13 @@ RETRY_TOKEN_MULTIPLIER = 2
 #   streamed response is never cut off client-side.
 # `send_temperature` — False omits the key entirely rather than sending a
 #   value the endpoint would reject with HTTP 400.
+#
+# v7: `max_output_tokens` is a CEILING, NOT A TARGET. Every model that has not
+# yet been observed in production gets the most generous budget we are willing
+# to afford rather than the smallest budget we think it needs. An unused
+# allowance is simply unspent; a tight ceiling converts a model that was going
+# to succeed into a `finish_reason=length` failure and a fall through to the
+# next model. That asymmetry is why GLM-5.3-Flash now matches Step 5 at 32000.
 MODEL_TUNING = [
     {
         "match": "step-5-preview",          # VPOWERFUL — Step 5 Preview
@@ -213,6 +290,30 @@ MODEL_TUNING = [
         "request_timeout": 900,
         "send_temperature": True,
         "note": "Model card: temperature=1.0, top_p=0.95, up to 1M output.",
+    },
+    {
+        # v6 (L9) added GLM; v7 raised its budget from 24000 to 32000, matching
+        # Step 5 Preview exactly. See the v7 docstring block for why: a ceiling
+        # is not a target, and over-provisioning a model that has never been
+        # observed costs nothing while under-provisioning it costs the run.
+        #
+        # Non-reasoning, so it has no chain-of-thought to fund — but that is an
+        # argument about what it will USE, not about what it should be ALLOWED.
+        #
+        # The doubled timeout (1800s vs Step 5's 900s) is retained from v6 and
+        # is the one knob that matters for a latency-heavy model: with
+        # streaming on, a long generation costs wall-clock, not correctness,
+        # so the only thing a timeout can do here is cut a good answer off.
+        # `temperature: 0.1` is still the house default rather than a GLM
+        # model-card value — the first knob to revisit if GLM's output reads
+        # flat. See the temperature note in the header block above.
+        "match": "glm",
+        "max_output_tokens": 32000,
+        "temperature": 0.1,
+        "top_p": 0.95,
+        "request_timeout": 1800,
+        "send_temperature": True,
+        "note": "GLM-5.3-Flash: 32000 like Step 5; 1800s ceiling for its latency.",
     },
     {
         "match": "nemotron",                # ULTRA / LIGHTNING / POWERFUL(Super)
@@ -307,6 +408,12 @@ NO_THINK_KWARG = True
 # entire token budget was consumed by CoT before a single answer token.
 # The gate is now an explicit per-model set, so non-Nemotron models are handled
 # by the same switch rather than falling through it.
+#
+# v6 (L9): GLM-5.3-Flash is NOT added here. It is a non-reasoning chat model,
+# so it has no thinking mode to disable, and sending `chat_template_kwargs`
+# to an endpoint that does not implement it is exactly the HTTP 400 that the
+# retry path exists to survive. Step 5 Preview is likewise absent and streams
+# fine on its default behaviour (confirmed by the 06:52 run).
 NO_THINK_MODEL_KEYWORDS = ["nemotron"]
 # ==============================================================================
 # OUTPUT VALIDATION GATE
@@ -324,10 +431,10 @@ REQUIRED_HEADERS = ["NEWS INTELLIGENCE BRIEF"]
 #   * NYT: Job Market        — HTTP 404 every run.
 #   * NYT: Corrections       — HTTP 404 every run.
 #   * Bloomberg: Green       — HTTP 404 every run.
-#   * WSJ (3 feeds)          — KEPT, but 20 fetched / 0 in window every run.
-#     See _absorb() for the diagnostic that says which of the two possible
-#     causes it is. Not guessed at here, because the fixes are opposite:
-#     stale pubDates want a wider window, a parse failure wants a parser fix.
+#   * WSJ (3 feeds)          — KEPT. Keeps 0 items because their pubDates are
+#     genuinely rooted in January 2025 (see the v6 docstring block). The fix
+#     is a WSJ-specific wider lookback, deliberately deferred to its own
+#     change rather than guessed at here.
 FEEDS = {
     # ──── Financial Times ────
     "FT: Home (International)": "https://www.ft.com/rss/home",
@@ -769,10 +876,13 @@ def _absorb(feed_name: str, content: bytes, all_articles: dict, allowed: set) ->
             all_articles[key] = art
             kept += 1
     print(f"    ✓ {feed_name}: {len(articles)} fetched, {kept} in window")
-    # v5: WSJ's three feeds have fetched 20 items and kept 0 on every run.
-    # That is either stale pubDates or a parse failure, and the two fixes are
-    # opposite, so log the parsed range instead of guessing. One line per run
-    # settles it.
+    # v5: a feed can yield items and keep none for two very different reasons —
+    # genuinely old pubDates, or items that only missed the window by hours.
+    # The diagnostic range tells them apart, which matters because the fixes
+    # are opposite: old dates want a wider lookback, fresh-but-outside dates
+    # want nothing at all. Left in permanently rather than removed once WSJ was
+    # diagnosed, because FT: China, FT: Americas and six NYT culture feeds also
+    # trip it and are all benign.
     if articles and kept == 0:
         oldest = min(a.pub_date for a in articles)
         newest = max(a.pub_date for a in articles)
@@ -870,7 +980,7 @@ def harvest_feeds() -> list[Article]:
 
     return sorted(all_articles.values(), key=lambda a: a.pub_date, reverse=True)
 # ==============================================================================
-# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF   (v4 policy, retained in v5)
+# SYSTEM PROMPT — NEWS INTELLIGENCE BRIEF   (v4 policy, retained in v5/v6/v7)
 # ==============================================================================
 # v4 change: human-interest and lifestyle items were promoted to first-class
 # content and romantic/sexual relationship coverage excluded.
@@ -883,7 +993,9 @@ def harvest_feeds() -> list[Article]:
 # instruction rather than by data.
 #
 # v5 edits to this prompt are limited to the two source lists, because WaPo is
-# no longer fetched (see the v5 feed removals above). Nothing else changed.
+# no longer fetched (see the v5 feed removals above). v6 and v7 change nothing
+# here — the balance policy and the romance exclusion are model-agnostic and
+# were deliberately left untouched by a model-chain change.
 SYSTEM_PROMPT = """
 ROLE: Senior Intelligence Analyst writing a morning brief that is read by two people over breakfast — one a markets professional who wants macro and financial density, one a general reader who wants people, culture and life.
 STYLE: Ultra-concise, dense, highly scannable. Zero conversational filler, zero setup sentences, zero meta-commentary. Every bullet must earn its place.
@@ -1201,6 +1313,13 @@ def generate_brief(user_prompt: str) -> tuple[str | None, str]:
         logger.info(f"[LLM] Tuning for {m['model']}: max_tokens={t['max_output_tokens']}, "
                     f"temperature={'omitted' if not t.get('send_temperature', True) else t['temperature']}, "
                     f"timeout={t['request_timeout']}s ({t['note']})")
+    # L9 (v6): print the chain order explicitly. With five entries the log line
+    # "PRIMARY" / "FALLBACK" no longer tells you which position a model holds,
+    # and knowing the position is how you tell a designed-for failure from an
+    # accidental one.
+    chain_desc = " -> ".join(f"{i+1}.{_tuning_for(m['model'])['match']}"
+                             for i, m in enumerate(valid_chain))
+    logger.info(f"[LLM] Chain order: {chain_desc}")
     for idx, model_cfg in enumerate(valid_chain):
         label = "PRIMARY" if idx == 0 else "FALLBACK"
         model_name = model_cfg["model"]
