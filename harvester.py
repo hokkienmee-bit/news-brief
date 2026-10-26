@@ -1166,6 +1166,8 @@ Content whose primary subject is interpersonal romantic or sexual relationships:
   2. Romantic and sexual "how-to" — relationship advice, marriage counselling, guides about partners, personal essays about romantic life.
   3. Celebrity romance, breakups, engagements, and romantic gossip.
   4. Anything whose news value is WHO SOMEONE IS INVOLVED WITH rather than WHAT HAPPENED.
+  5. Any articles about retirement savings.
+  6. Any articles about wealth management.
 The reason is editorial: this brief is read by two people together, and romantic/relationship material tends to start conversations that neither reader wants at breakfast.
 
 Also skip, regardless of band:
