@@ -1168,6 +1168,8 @@ Content whose primary subject is interpersonal romantic or sexual relationships:
   4. Anything whose news value is WHO SOMEONE IS INVOLVED WITH rather than WHAT HAPPENED.
   5. Any articles about retirement savings.
   6. Any articles about wealth management.
+  7. Any articles citing investment returns.
+  8. Any articles citing compensation such as salaries, bonuses, signing bonuses or otherwise.
 The reason is editorial: this brief is read by two people together, and romantic/relationship material tends to start conversations that neither reader wants at breakfast.
 
 Also skip, regardless of band:
