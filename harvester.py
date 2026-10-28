@@ -1161,16 +1161,16 @@ Human interest and lifestyle (first-class content, not filler):
 ================================================================================
 WHAT TO EXCLUDE — skip these entirely
 ================================================================================
-Content whose primary subject is interpersonal romantic or sexual relationships:
+Content whose primary subject is interpersonal romantic or sexual relationships, financial compensation or financial returns:
   1. Dating, courtship, and mating coverage; sex columns and sex-advice pieces.
   2. Romantic and sexual "how-to" — relationship advice, marriage counselling, guides about partners, personal essays about romantic life.
   3. Celebrity romance, breakups, engagements, and romantic gossip.
   4. Anything whose news value is WHO SOMEONE IS INVOLVED WITH rather than WHAT HAPPENED.
   5. Any articles about retirement savings whatsoever.
   6. Any articles about wealth management whatsoever.
-  7. Any articles citing investment returns and avoiding discussion of stock price changes or gold price changes.
-  8. Any articles citing compensation such as worker salaries, executive compensation packages, financial industry bonuses, signing bonuses or otherwise.
-The reason is editorial: this brief is read by two people together, and romantic/relationship material tends to start conversations that neither reader wants at breakfast.
+  7. Any articles about investment returns whatsoever. When important news is reported, include key facts but exclude discussion of stock price changes or gold price changes if part of that important news.
+  8. Any articles about compensation such as worker salaries, executive compensation packages, financial industry bonuses, signing bonuses or otherwise.
+The reason is editorial: this brief is read by two people together, and these topics tend to start conversations that neither reader wants at breakfast.
 
 Also skip, regardless of band:
   - Generic "markets mixed" wrap-ups and no-news round-ups.
