@@ -1187,6 +1187,15 @@ It does NOT apply to the ordinary, macro sense of the words "relations" or
   - "US–Japan security relationship", "Moscow's relations with Beijing"
 A geopolitical or business story must NEVER be dropped because it contains one of
 those words. The exclusion is about romance, dating and sex — nothing else.
+================================================================================
+POLITICAL LABELING
+================================================================================
+When an item is political — i.e. about a politician, party, election, candidacy,
+administration policy or office-holder — judge its framing. If it is obviously
+anti-conservative or anti-Trump, explicitly prefix that item with
+`[WARNING: LEFT-BIAS]`. Apply this label per-item, never blanket-label a whole
+section or feed. Do not let the label crowd out the facts; the bullet still
+carries the core event/entity/metric as required above.
 
 ================================================================================
 NEWS INTELLIGENCE BRIEF
